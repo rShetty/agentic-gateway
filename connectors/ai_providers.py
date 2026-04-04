@@ -326,7 +326,7 @@ class AnthropicConnector(BaseConnector):
                             "description": "Conversation messages (no system message here)",
                         },
                         "system": {"type": "string", "description": "System prompt"},
-                        "model": {"type": "string", "default": "claude-sonnet-4-20250514", 
+                        "model": {"type": "string", "default": "claude-sonnet-4-20250514",
                                   "description": "Model: claude-opus-4, claude-sonnet-4, claude-haiku-3.5"},
                         "max_tokens": {"type": "integer", "default": 4096},
                         "temperature": {"type": "number", "default": 0.7},

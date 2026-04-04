@@ -31,9 +31,10 @@ from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from config.settings import (
-    GatewayConfig, 
-    get_config, 
+    GatewayConfig,
+    get_config,
     BACKEND_DEFINITIONS,
+    ROUTING_CONFIG,
     OAuthSettings,
     SecuritySettings,
     BackendSettings,
@@ -154,19 +155,30 @@ def _create_app_state_sync(config: GatewayConfig) -> AppState:
     
     # Register backends from definitions (synchronous)
     for backend_id, backend_def in BACKEND_DEFINITIONS.items():
+        if backend_def["type"] == "mcp":
+            backend_type = BackendType.MCP_STDIO
+        elif backend_def.get("api_type") == "graphql":
+            backend_type = BackendType.API_GRAPHQL
+        else:
+            backend_type = BackendType.API_REST
+
+        # Only include env var if it has a non-empty value
+        _env_val = os.getenv(backend_def["env_key"]) if backend_def.get("env_key") else None
+        _env = {backend_def["env_key"]: _env_val} if _env_val else {}
+
         definition = BackendDefinition(
             id=backend_id,
             name=backend_def["name"],
             description=backend_def["description"],
-            backend_type=BackendType.MCP_STDIO if backend_def["type"] == "mcp" else BackendType.API_REST,
+            backend_type=backend_type,
             enabled=True,
             requires_auth=backend_def.get("requires_auth", False),
             env_key=backend_def.get("env_key"),
+            connector=backend_def.get("connector"),
             tools=backend_def.get("tools", []),
             command=backend_def.get("command"),
             args=backend_def.get("args", []),
-            env={backend_def["env_key"]: os.getenv(backend_def["env_key"], "")} 
-                if backend_def.get("env_key") else {},
+            env=_env,
             url=backend_def.get("url"),
             base_url=backend_def.get("base_url"),
             auth_type=backend_def.get("auth_type"),
@@ -270,19 +282,29 @@ async def lifespan(app: FastAPI):
     
     # Register backends from definitions
     for backend_id, backend_def in BACKEND_DEFINITIONS.items():
+        if backend_def["type"] == "mcp":
+            backend_type = BackendType.MCP_STDIO
+        elif backend_def.get("api_type") == "graphql":
+            backend_type = BackendType.API_GRAPHQL
+        else:
+            backend_type = BackendType.API_REST
+
+        _env_val = os.getenv(backend_def["env_key"]) if backend_def.get("env_key") else None
+        _env = {backend_def["env_key"]: _env_val} if _env_val else {}
+
         definition = BackendDefinition(
             id=backend_id,
             name=backend_def["name"],
             description=backend_def["description"],
-            backend_type=BackendType.MCP_STDIO if backend_def["type"] == "mcp" else BackendType.API_REST,
+            backend_type=backend_type,
             enabled=True,
             requires_auth=backend_def.get("requires_auth", False),
             env_key=backend_def.get("env_key"),
+            connector=backend_def.get("connector"),
             tools=backend_def.get("tools", []),
             command=backend_def.get("command"),
             args=backend_def.get("args", []),
-            env={backend_def["env_key"]: os.getenv(backend_def["env_key"], "")} 
-                if backend_def.get("env_key") else {},
+            env=_env,
             url=backend_def.get("url"),
             base_url=backend_def.get("base_url"),
             auth_type=backend_def.get("auth_type"),
@@ -441,7 +463,7 @@ class TokenRequest(BaseModel):
     code: Optional[str] = None
     code_verifier: Optional[str] = None
     client_id: str
-    redirect_uri: str
+    redirect_uri: Optional[str] = None
     refresh_token: Optional[str] = None
 
 
@@ -552,7 +574,6 @@ async def token_endpoint(req: TokenRequest):
         
         token_pair = state.oauth.refresh_access_token(
             refresh_token=req.refresh_token,
-            client_id=req.client_id,
         )
         
         if not token_pair:
@@ -989,7 +1010,12 @@ async def _execute_tool(
     """
     Shared tool execution logic for both v1 and mcp endpoints.
 
-    Token resolution order (per-user credential takes priority):
+    Routing decision (configurable per-service via ROUTING_CONFIG):
+    - "connector" → direct API connector (httpx)
+    - "backend"   → MCP server or API backend
+    - "auto"      → prefer connector, fall back to backend on failure
+
+    Token resolution (per-user credential takes priority):
     1. Look up a user-specific token in the TokenStore for the connector.
     2. Fall back to the shared env-var credential registered at startup.
     """
@@ -1009,60 +1035,74 @@ async def _execute_tool(
         raise HTTPException(status_code=400, detail=sanitized)
 
     connector_name = state.connectors._tool_index.get(tool_name)
-    
-    # Determine if this is a connector tool or backend tool
-    # and resolve the appropriate token
-    user_token = None
-    
-    if connector_name:
-        # Connector tool - use connector-specific token
+    resolved_backend_id = backend_id or state.backends._tool_index.get(tool_name)
+
+    async def _resolve_token_async(service_name: str) -> Optional[str]:
         jwt_user_id = user["user_id"]
-        
-        # Try JWT user first, then fall back to "default" user
-        user_token = await get_token_store().get_token(jwt_user_id, connector_name)
-        if not user_token:
-            user_token = await get_token_store().get_token("default", connector_name)
-        
-        if not user_token:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"No credentials configured for '{connector_name}'. Set {connector_name.upper()}_PERSONAL_ACCESS_TOKEN as an environment variable (shared), or store your personal token via POST /v1/tokens."},
-            )
-        
-        success, result = await state.connectors.call_tool(
+        token = await get_token_store().get_token(jwt_user_id, service_name)
+        if not token:
+            token = await get_token_store().get_token("default", service_name)
+        return token
+
+    async def _try_connector() -> Tuple[bool, Any]:
+        token = await _resolve_token_async(connector_name)
+        if not token:
+            return False, f"No credentials for '{connector_name}'. Store a token via POST /v1/tokens or set the env var."
+        return await state.connectors.call_tool(
             tool_name=tool_name,
             arguments=sanitized,
-            user_token=user_token,
+            user_token=token,
         )
-    else:
-        # Backend tool - check if backend has OAuth connector mapping
-        backend_id = backend_id or state.backends._tool_index.get(tool_name)
-        
-        if backend_id:
-            # Check if this backend has a connector mapping for OAuth
-            backend_state = state.backends._backends.get(backend_id)
-            if backend_state and backend_state.definition.connector:
-                # Backend supports OAuth - get per-user token
-                connector_name = backend_state.definition.connector
-                jwt_user_id = user["user_id"]
-                
-                user_token = await get_token_store().get_token(jwt_user_id, connector_name)
-                if not user_token:
-                    user_token = await get_token_store().get_token("default", connector_name)
-                
-                if not user_token:
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": f"No credentials configured for '{connector_name}'. Set {connector_name.upper()}_PERSONAL_ACCESS_TOKEN as an environment variable (shared), or store your personal token via POST /v1/tokens."},
-                    )
-        
-        success, result = await state.backends.call_tool(
+
+    async def _try_backend() -> Tuple[bool, Any]:
+        bid = resolved_backend_id
+        if not bid:
+            return False, f"Tool '{tool_name}' not found in any backend"
+        bstate = state.backends._backends.get(bid)
+        token = None
+        if bstate and bstate.definition.connector:
+            token = await _resolve_token_async(bstate.definition.connector)
+            if not token:
+                return False, f"No credentials for '{bstate.definition.connector}'. Store a token via POST /v1/tokens or set the env var."
+        return await state.backends.call_tool(
             tool_name=tool_name,
             arguments=sanitized,
-            backend_id=backend_id,
+            backend_id=bid,
             timeout=timeout,
-            user_token=user_token,
+            user_token=token,
         )
+
+    routing = ROUTING_CONFIG.get(connector_name or resolved_backend_id, "auto")
+
+    if routing == "connector":
+        if connector_name:
+            success, result = await _try_connector()
+        elif resolved_backend_id:
+            bstate = state.backends._backends.get(resolved_backend_id)
+            if bstate and bstate.definition.connector:
+                success, result = await _try_backend()
+            else:
+                success, result = False, f"No connector available for tool '{tool_name}'"
+        else:
+            success, result = False, f"Tool '{tool_name}' not found"
+    elif routing == "backend":
+        if resolved_backend_id:
+            success, result = await _try_backend()
+        elif connector_name:
+            success, result = await _try_connector()
+        else:
+            success, result = False, f"Tool '{tool_name}' not found"
+    else:
+        if connector_name:
+            success, result = await _try_connector()
+            if not success and resolved_backend_id:
+                success, result = await _try_backend()
+        elif resolved_backend_id:
+            success, result = await _try_backend()
+            if not success and connector_name:
+                success, result = await _try_connector()
+        else:
+            success, result = False, f"Tool '{tool_name}' not found"
 
     state.security.log_tool_call(
         client_id=user["client_id"],
@@ -1157,8 +1197,8 @@ async def connectors_page(
         <h1>Connect Your Services</h1>
         <p class="subtitle">Link your accounts to enable tool access through the gateway.</p>
         
-        """ + (f'<div class="error">' + error + '</div>' if error else '') + """
-        """ + (f'<div class="success">' + success + '</div>' if success else '') + """
+        """ + (f'<div class="error">{html.escape(error)}</div>' if error else '') + """
+        """ + (f'<div class="success">{html.escape(success)}</div>' if success else '') + """
         
         <div class="connectors-grid">
 """
@@ -1462,7 +1502,7 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
     Create an MCP server using FastMCP that proxies to registered backends.
     
     This creates an MCP server that Cursor/Claude Code can connect to.
-    It dynamically discovers tools from MCP backends and exposes them.
+    It dynamically discovers tools from MCP backends and exposes them as native MCP tools.
     
     The server uses OAuth 2.1 JWT authentication:
     - MCP client must initialize with a valid JWT access token
@@ -1482,7 +1522,6 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
     
     config = get_config()
     
-    # Use provided state or fall back to global state
     if app_state is None:
         if state is None and init_state:
             logger.info("Initializing state for standalone MCP server")
@@ -1494,26 +1533,8 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
         logger.error("Cannot create MCP server: app_state is None. Ensure server is running or init_state=True")
         return None
     
-    # Get MCP server settings from config
     mcp_host = config.server.mcp_host
     mcp_port = config.server.mcp_port
-    
-    # Create auth callback for OAuth 2.1 JWT validation
-    async def mcp_auth_callback(token: str) -> Optional[dict]:
-        """
-        Validate JWT token from MCP client initialization.
-        
-        The MCP client passes their JWT access token during initialize.
-        We validate it and return user info for tool calls.
-        """
-        if not token:
-            return None
-        user_info = app_state.oauth.validate_access_token(token)
-        if not user_info:
-            logger.warning("MCP auth: invalid or expired JWT")
-            return None
-        logger.info(f"MCP auth: validated user {user_info.get('user_id')}")
-        return user_info
     
     mcp = FastMCP(
         config.server.server_name,
@@ -1529,194 +1550,146 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
         message_path="/messages/",
     )
     
-    # Set auth callback (FastMCP will call this during initialization)
-    # The token is passed in the initialize request's headers or auth field
-    # We'll handle this via the tool that requires auth
-    
-    @mcp.tool()
-    def gateway_list_backends(authorization: str = None) -> str:
-        """List all available backend services.
-        
-        Args:
-            authorization: JWT access token for authentication (Bearer <token>)
-        """
-        # Validate auth
-        if not authorization:
-            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
-        if not authorization.startswith("Bearer "):
-            return json.dumps({"error": "Invalid Authorization format", "hint": "Use: Bearer <jwt_token>"})
-        
+    async def _validate_auth(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Validate JWT and return user_info or None."""
+        if not authorization or not authorization.startswith("Bearer "):
+            return None
         token = authorization[7:]
         user_info = app_state.oauth.validate_access_token(token)
         if not user_info:
-            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
+            return None
+        return user_info
+    
+    async def _resolve_user_token(user_id: str, service_name: str) -> Optional[str]:
+        """Resolve a user's token for a service from the TokenStore."""
+        from auth.token_store import get_token_store
+        token = await get_token_store().get_token(user_id, service_name)
+        if not token:
+            token = await get_token_store().get_token("default", service_name)
+        return token
+    
+    async def _execute_discovered_tool(
+        tool_name: str,
+        arguments: Dict[str, Any],
+        authorization: Optional[str],
+    ) -> str:
+        """Execute a discovered tool with auth and token resolution."""
+        user_info = await _validate_auth(authorization)
+        if not user_info:
+            return json.dumps({"error": "Invalid or missing authorization"})
         
+        user_id = user_info.get("user_id")
+        
+        connector_name = app_state.connectors._tool_index.get(tool_name)
+        backend_id = app_state.backends._tool_index.get(tool_name)
+        
+        if connector_name:
+            user_token = await _resolve_user_token(user_id, connector_name)
+            if not user_token:
+                return json.dumps({
+                    "error": f"No credentials for '{connector_name}'",
+                    "hint": f"Store a token via POST /v1/tokens or visit /oauth/authorize/{connector_name}",
+                })
+            success, result = await app_state.connectors.call_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                user_token=user_token,
+            )
+        elif backend_id:
+            backend_state = app_state.backends._backends.get(backend_id)
+            user_token = None
+            if backend_state and backend_state.definition.connector:
+                user_token = await _resolve_user_token(user_id, backend_state.definition.connector)
+                if not user_token:
+                    return json.dumps({
+                        "error": f"No credentials for '{backend_state.definition.connector}'",
+                        "hint": f"Store a token via POST /v1/tokens or visit /oauth/authorize/{backend_state.definition.connector}",
+                    })
+            success, result = await app_state.backends.call_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                backend_id=backend_id,
+                user_token=user_token,
+            )
+        else:
+            return json.dumps({"error": f"Tool '{tool_name}' not found in any backend or connector"})
+        
+        if not success:
+            return json.dumps({"error": result})
+        return json.dumps({"result": result})
+    
+    # --- Gateway management tools ---
+    
+    @mcp.tool()
+    async def gateway_list_backends(authorization: Optional[str] = None) -> str:
+        """List all available backend services and their health status."""
+        user_info = await _validate_auth(authorization)
+        if not user_info:
+            return json.dumps({"error": "Invalid or missing authorization"})
         return json.dumps(app_state.backends.list_backends(), indent=2)
 
     @mcp.tool()
-    def gateway_list_tools(authorization: str = None) -> str:
-        """List all available tools across backends and connectors.
-        
-        Args:
-            authorization: JWT access token for authentication (Bearer <token>)
-        """
-        # Validate auth
-        if not authorization:
-            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
-        if not authorization.startswith("Bearer "):
-            return json.dumps({"error": "Invalid Authorization format", "hint": "Use: Bearer <jwt_token>"})
-        
-        token = authorization[7:]
-        user_info = app_state.oauth.validate_access_token(token)
+    async def gateway_list_tools(authorization: Optional[str] = None) -> str:
+        """List all available tools across backends and connectors."""
+        user_info = await _validate_auth(authorization)
         if not user_info:
-            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
-        
+            return json.dumps({"error": "Invalid or missing authorization"})
         backend_tools = app_state.backends.list_tools()
         connector_tools = app_state.connectors.get_all_tools()
-        all_tools = backend_tools + connector_tools
-        return json.dumps(all_tools, indent=2)
+        return json.dumps({"backend_tools": backend_tools, "connector_tools": connector_tools}, indent=2)
 
     @mcp.tool()
-    async def gateway_connect_backend(backend_id: str, authorization: str = None) -> str:
-        """Connect to a backend service.
-        
-        Args:
-            backend_id: ID of the backend to connect
-            authorization: JWT access token for authentication
-        """
-        # Validate auth
-        if not authorization or not authorization.startswith("Bearer "):
-            return json.dumps({"error": "Missing Authorization header"})
-        
-        token = authorization[7:]
-        user_info = app_state.oauth.validate_access_token(token)
+    async def gateway_connect_backend(backend_id: str, authorization: Optional[str] = None) -> str:
+        """Connect to a specific backend service."""
+        user_info = await _validate_auth(authorization)
         if not user_info:
-            return json.dumps({"error": "Invalid or expired token"})
-        
+            return json.dumps({"error": "Invalid or missing authorization"})
         success, error = await app_state.backends.connect_backend(backend_id)
         if not success:
             return json.dumps({"error": error})
         return json.dumps({"connected": backend_id})
 
     @mcp.tool()
-    async def gateway_auth_status(authorization: str = None) -> str:
-        """Check authentication and third-party connection status.
-        
-        Returns the user's OAuth status and connected third-party services.
-        
-        Args:
-            authorization: JWT access token for authentication
-        """
-        # Validate auth
-        if not authorization or not authorization.startswith("Bearer "):
-            return json.dumps({"error": "Missing Authorization header"})
-        
-        token = authorization[7:]
-        user_info = app_state.oauth.validate_access_token(token)
+    async def gateway_auth_status(authorization: Optional[str] = None) -> str:
+        """Check authentication and third-party connection status."""
+        user_info = await _validate_auth(authorization)
         if not user_info:
-            return json.dumps({"error": "Invalid or expired token"})
-        
+            return json.dumps({"error": "Invalid or missing authorization"})
         user_id = user_info.get("user_id")
-        
-        # Get list of connected third-party tokens
         from auth.token_store import get_token_store
         connected = await get_token_store().list_connectors_for_user(user_id)
-        
         return json.dumps({
             "user_id": user_id,
             "connected_services": connected,
             "auth_endpoint": "http://localhost:8000/oauth/authorize/{connector}",
-            "token_endpoint": "http://localhost:8000/oauth/token"
         }, indent=2)
-
+    
+    # --- Dynamically discovered tools from MCP backends ---
+    # Instead of hardcoding tool wrappers, we discover tools from connected
+    # MCP backends and expose them as native MCP tools via a generic dispatcher.
+    # This is the MCP discovery pattern: tools are discovered at runtime.
+    
     @mcp.tool()
     async def gateway_call_tool(
         tool_name: str,
         arguments: str = "{}",
-        authorization: str = None,
-        backend_id: str = None
+        authorization: Optional[str] = None,
     ) -> str:
-        """Call a tool on a backend or connector.
+        """Call any tool discovered from backends or connectors.
+        
+        Use gateway_list_tools to see available tools first.
         
         Args:
             tool_name: Name of the tool to call
-            arguments: JSON string of arguments
-            authorization: JWT access token for authentication
-            backend_id: Optional backend ID (for MCP backends)
+            arguments: JSON string of tool arguments
+            authorization: JWT access token (Bearer <token>)
         """
-        # Validate auth
-        if not authorization or not authorization.startswith("Bearer "):
-            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
-        
-        token = authorization[7:]
-        user_info = app_state.oauth.validate_access_token(token)
-        if not user_info:
-            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
-        
-        # Parse arguments
         try:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
         except json.JSONDecodeError:
             return json.dumps({"error": "Invalid JSON in arguments"})
-        
-        user_id = user_info.get("user_id")
-        
-        # Determine if this is a connector tool or backend tool
-        # and resolve the appropriate token
-        from auth.token_store import get_token_store
-        user_token = None
-        
-        connector_name = app_state.connectors._tool_index.get(tool_name)
-        
-        if connector_name:
-            # Connector tool - use connector-specific token
-            user_token = await get_token_store().get_token(user_id, connector_name)
-            
-            if not user_token:
-                return json.dumps({
-                    "error": f"Not authenticated with {connector_name}",
-                    "hint": f"Visit http://localhost:8000/oauth/authorize/{connector_name} to connect",
-                    "connector": connector_name
-                })
-            
-            # Call connector tool with user's token
-            success, result = await app_state.connectors.call_tool(
-                tool_name=tool_name,
-                arguments=args,
-                user_token=user_token,
-            )
-        else:
-            # Backend tool - check if backend has OAuth connector mapping
-            backend_id = backend_id or app_state.backends._tool_index.get(tool_name)
-            
-            if backend_id:
-                # Check if this backend has a connector mapping for OAuth
-                backend_state = app_state.backends._backends.get(backend_id)
-                if backend_state and backend_state.definition.connector:
-                    # Backend supports OAuth - get per-user token
-                    connector_name = backend_state.definition.connector
-                    
-                    user_token = await get_token_store().get_token(user_id, connector_name)
-                    
-                    if not user_token:
-                        return json.dumps({
-                            "error": f"Not authenticated with {connector_name}",
-                            "hint": f"Visit http://localhost:8000/oauth/authorize/{connector_name} to connect",
-                            "connector": connector_name
-                        })
-            
-            # Call backend tool (with user_token if available)
-            success, result = await app_state.backends.call_tool(
-                tool_name=tool_name,
-                arguments=args,
-                backend_id=backend_id,
-                user_token=user_token,
-            )
-        
-        if not success:
-            return json.dumps({"error": result})
-        return json.dumps({"result": result}, indent=2)
-
+        return await _execute_discovered_tool(tool_name, args, authorization)
+    
     return mcp
 
 
@@ -1792,19 +1765,29 @@ def run_mcp_proxy(backend_id: str = "github"):
         )
         
         for backend_id_def, backend_def in BACKEND_DEFINITIONS.items():
+            if backend_def["type"] == "mcp":
+                backend_type = BackendType.MCP_STDIO
+            elif backend_def.get("api_type") == "graphql":
+                backend_type = BackendType.API_GRAPHQL
+            else:
+                backend_type = BackendType.API_REST
+
+            _env_val = os.getenv(backend_def["env_key"]) if backend_def.get("env_key") else None
+            _env = {backend_def["env_key"]: _env_val} if _env_val else {}
+
             definition = BackendDefinition(
                 id=backend_id_def,
                 name=backend_def["name"],
                 description=backend_def["description"],
-                backend_type=BackendType.MCP_STDIO if backend_def["type"] == "mcp" else BackendType.API_REST,
+                backend_type=backend_type,
                 enabled=True,
                 requires_auth=backend_def.get("requires_auth", False),
                 env_key=backend_def.get("env_key"),
+                connector=backend_def.get("connector"),
                 tools=backend_def.get("tools", []),
                 command=backend_def.get("command"),
                 args=backend_def.get("args", []),
-                env={backend_def["env_key"]: os.getenv(backend_def["env_key"], "")} 
-                    if backend_def.get("env_key") else {},
+                env=_env,
                 url=backend_def.get("url"),
                 base_url=backend_def.get("base_url"),
                 auth_type=backend_def.get("auth_type"),

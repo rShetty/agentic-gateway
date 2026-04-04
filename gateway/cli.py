@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from typing import Optional
 
 
@@ -162,13 +163,80 @@ def cmd_mcp_proxy(args):
     run_mcp_proxy(backend_id=args.backend)
 
 
+def cmd_github_search(args):
+    """Search GitHub repositories through the gateway."""
+    import json
+    import urllib.request
+    import urllib.error
+
+    api_key = args.api_key or os.getenv("GATEWAY_API_KEY")
+    if not api_key:
+        print("Error: No API key provided. Use --api-key or set GATEWAY_API_KEY env var.")
+        return
+
+    query = args.query
+    if "in:name" not in query:
+        query = f"{query} in:name"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "tool_name": "search_repositories",
+        "arguments": {
+            "query": query,
+            "sort": args.sort,
+            "order": args.order,
+            "limit": args.limit,
+        },
+    }
+
+    url = f"{args.gateway_url}/v1/call"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"Error ({e.code}): {e.read().decode('utf-8')}")
+        return
+    except urllib.error.URLError as e:
+        print(f"Error connecting to gateway: {e.reason}")
+        return
+
+    if not result.get("success"):
+        print(f"Error: {result.get('error', 'Unknown error')}")
+        return
+
+    data = result.get("result", {})
+    total = data.get("total_count", 0)
+    repos = data.get("repositories", [])
+
+    if not repos:
+        print(f"No repositories found matching '{args.query}'.")
+        return
+
+    print(f"\nFound {total} repositories matching '{args.query}':\n")
+
+    for i, repo in enumerate(repos, 1):
+        print(f"  {i}. {repo['full_name']}")
+        if repo.get("description"):
+            print(f"     {repo['description']}")
+        print(f"     Stars: {repo['stars']}  |  Forks: {repo['forks']}  |  Language: {repo['language'] or 'N/A'}")
+        print(f"     URL: {repo['url']}")
+        print()
+
+
 def cmd_generate_pkce(args):
     """Generate PKCE code verifier and challenge."""
     from auth.oauth import generate_code_verifier, generate_code_challenge
-    
+
     verifier = generate_code_verifier(args.length)
     challenge = generate_code_challenge(verifier, args.method)
-    
+
     print(f"Code Verifier: {verifier}")
     print(f"Code Challenge: {challenge}")
     print(f"Method: {args.method}")
@@ -253,6 +321,16 @@ Examples:
     call_parser.add_argument("--gateway-url", default="http://localhost:8000", help="Gateway URL")
     call_parser.set_defaults(func=cmd_call_tool)
     
+    # github-search
+    gh_parser = subparsers.add_parser("github-search", help="Search GitHub repositories through the gateway")
+    gh_parser.add_argument("query", help="Repository name or search term")
+    gh_parser.add_argument("--sort", default="stars", choices=["stars", "forks", "updated"], help="Sort order")
+    gh_parser.add_argument("--order", default="desc", choices=["asc", "desc"], help="Sort direction")
+    gh_parser.add_argument("--limit", type=int, default=30, help="Max results (default: 30)")
+    gh_parser.add_argument("--api-key", help="Gateway API key (or set GATEWAY_API_KEY env var)")
+    gh_parser.add_argument("--gateway-url", default="http://localhost:8000", help="Gateway URL")
+    gh_parser.set_defaults(func=cmd_github_search)
+
     # generate-pkce
     pkce_parser = subparsers.add_parser("generate-pkce", help="Generate PKCE verifier and challenge")
     pkce_parser.add_argument("--length", type=int, default=128, help="Code verifier length")

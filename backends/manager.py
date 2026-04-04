@@ -511,11 +511,36 @@ class BackendManager:
         state = BackendState(definition=definition)
         self._backends[definition.id] = state
         
-        # Index tools
+        # Only index tools from static config if the list is non-empty.
+        # MCP backends will populate tools dynamically after connection.
+        # API backends inherit tool names from their connector mapping.
         for tool_name in definition.tools:
             self._tool_index[tool_name] = definition.id
         
         logger.info(f"Registered backend: {definition.id} ({definition.backend_type.value})")
+
+    async def _populate_mcp_tools(self, backend_id: str) -> None:
+        """Discover tools from a live MCP session and update the index."""
+        success, tools = await self._mcp_handler.list_tools(backend_id)
+        if success:
+            state = self._backends.get(backend_id)
+            if state:
+                old_tools = set(state.definition.tools)
+                new_tools = [t["name"] for t in tools]
+                state.definition.tools = new_tools
+                
+                for tool_name in old_tools:
+                    if self._tool_index.get(tool_name) == backend_id:
+                        del self._tool_index[tool_name]
+                for tool_name in new_tools:
+                    self._tool_index[tool_name] = backend_id
+                
+                logger.info(
+                    f"Backend {backend_id}: discovered {len(new_tools)} tools "
+                    f"from MCP server ({', '.join(new_tools[:5])}{'...' if len(new_tools) > 5 else ''})"
+                )
+        else:
+            logger.warning(f"Failed to discover tools for MCP backend {backend_id}")
 
     def unregister_backend(self, backend_id: str) -> None:
         """Unregister a backend."""
@@ -599,6 +624,9 @@ class BackendManager:
             state.last_healthy = datetime.now(timezone.utc)
             state.consecutive_failures = 0
             logger.info(f"Connected to backend: {backend_id} ({latency_ms:.0f}ms)")
+            
+            if definition.backend_type in (BackendType.MCP_STDIO, BackendType.MCP_HTTP):
+                await self._populate_mcp_tools(backend_id)
         else:
             state.status = BackendStatus.UNHEALTHY
             state.last_error = error
@@ -674,7 +702,6 @@ class BackendManager:
         Returns:
             (success, result_or_error)
         """
-        # Find backend
         if backend_id is None:
             backend_id = self._tool_index.get(tool_name)
         
@@ -708,13 +735,17 @@ class BackendManager:
                     timeout=timeout,
                     user_token=user_token,
                 )
-            else:
-                # API backend - this would need more sophisticated routing
+            elif definition.backend_type == BackendType.API_REST:
                 success, result = await self._call_api_tool(
                     definition, tool_name, arguments, timeout, user_token
                 )
+            elif definition.backend_type == BackendType.API_GRAPHQL:
+                success, result = await self._call_graphql_tool(
+                    definition, tool_name, arguments, timeout, user_token
+                )
+            else:
+                return False, f"Unsupported backend type: {definition.backend_type}"
             
-            # Update metrics
             latency_ms = (time.time() - start_time) * 1000
             state.total_requests += 1
             state.avg_latency_ms = (state.avg_latency_ms + latency_ms) / 2
@@ -745,42 +776,67 @@ class BackendManager:
         user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
-        Call a tool on an API backend.
-        
-        Args:
-            definition: Backend definition
-            tool_name: Name of the tool to call
-            arguments: Tool arguments
-            timeout: Timeout in seconds
-            user_token: Optional per-user token (takes priority over env var)
-            
-        This is a simplified implementation - production would need
-        tool-specific handlers for each API.
+        Call a tool on an API backend by delegating to the connector's
+        tool-specific handler.  This avoids the old stub that blindly
+        POSTed to /{tool_name}.
         """
-        # Build headers from auth config
-        headers = dict(definition.headers)
-        
-        # Use per-user token if provided, otherwise fall back to env var
+        from connectors import get_registry, ConnectorConfig
+
         cred = user_token if user_token else os.getenv(definition.env_key, "")
-        
-        if cred:
-            if definition.auth_type == "bearer":
-                headers["Authorization"] = f"Bearer {cred}"
-            elif definition.auth_type == "x-api-key":
-                headers["x-api-key"] = cred
-            else:
-                headers["Authorization"] = f"Bearer {cred}"
-        
-        # For now, treat tool_name as endpoint and arguments as body
-        return await self._api_handler.call_rest(
-            backend_id=definition.id,
-            base_url=definition.base_url,
-            headers=headers,
-            method="POST",
-            endpoint=f"/{tool_name}",
-            json_data=arguments,
-            timeout=timeout,
-        )
+        if not cred:
+            return False, (
+                f"No credentials for '{definition.id}'. "
+                f"Set {definition.env_key} or store a token via POST /v1/tokens."
+            )
+
+        connector_name = definition.connector or definition.id
+        registry = get_registry()
+        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
+        if conn_class is None:
+            return False, f"No connector class for '{connector_name}'"
+
+        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
+        connector = conn_class(config)
+        try:
+            success, result = await connector.call_tool(tool_name, arguments)
+            return success, result
+        finally:
+            await connector.close()
+
+    async def _call_graphql_tool(
+        self,
+        definition: BackendDefinition,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: int,
+        user_token: Optional[str] = None,
+    ) -> Tuple[bool, Any]:
+        """
+        Call a tool on a GraphQL API backend by delegating to the connector's
+        tool-specific handler (which already knows how to build GraphQL queries).
+        """
+        from connectors import get_registry, ConnectorConfig
+
+        cred = user_token if user_token else os.getenv(definition.env_key, "")
+        if not cred:
+            return False, (
+                f"No credentials for '{definition.id}'. "
+                f"Set {definition.env_key} or store a token via POST /v1/tokens."
+            )
+
+        connector_name = definition.connector or definition.id
+        registry = get_registry()
+        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
+        if conn_class is None:
+            return False, f"No connector class for '{connector_name}'"
+
+        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
+        connector = conn_class(config)
+        try:
+            success, result = await connector.call_tool(tool_name, arguments)
+            return success, result
+        finally:
+            await connector.close()
 
     # -------------------------------------------------------------------------
     # Health Monitoring

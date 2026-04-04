@@ -9,7 +9,7 @@ import secrets
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
-from auth.oauth import OAuthProvider, AuthorizationCode, ClientRegistration, User
+from auth.oauth import OAuthProvider, AuthorizationCode, ClientRegistration, User, TokenPair
 from auth import database as db
 
 logger = logging.getLogger(__name__)
@@ -180,7 +180,7 @@ class DatabaseOAuthProvider(OAuthProvider):
         user_id: str,
         scope: Optional[str] = None,
         include_refresh: bool = True,
-    ) -> tuple:
+    ) -> TokenPair:
         """Create access and refresh token pair."""
         access_token = self.jwt.create_access_token(
             user_id=user_id,
@@ -206,16 +206,6 @@ class DatabaseOAuthProvider(OAuthProvider):
             expires_at=expires_at.isoformat(),
             scope=scope,
         )
-        
-        # Create token pair object
-        from dataclasses import dataclass
-        @dataclass
-        class TokenPair:
-            access_token: str
-            refresh_token: Optional[str]
-            expires_in: int
-            token_type: str = "Bearer"
-            scope: str = "mcp:tools"
         
         return TokenPair(
             access_token=access_token,
@@ -247,18 +237,15 @@ class DatabaseOAuthProvider(OAuthProvider):
             "scope": payload.scope,
         }
     
-    def refresh_access_token(self, refresh_token: str) -> Optional[tuple]:
+    def refresh_access_token(self, refresh_token: str) -> Optional["TokenPair"]:
         """Refresh access token."""
-        # Use parent's JWT validation
         payload = self.jwt.decode_token(refresh_token)
         if not payload:
             return None
         
-        # Check if revoked using database
         if db.is_token_revoked(payload.jti):
             return None
         
-        # Create new token pair
         return self._create_token_pair(
             client_id=payload.client_id,
             user_id=payload.sub,
@@ -271,12 +258,9 @@ class DatabaseOAuthProvider(OAuthProvider):
         if not payload:
             return False
         
-        # Calculate expiration
-        exp = payload.get("exp", 0)
-        from datetime import datetime
-        expires_at = datetime.fromtimestamp(exp, timezone.utc)
+        # payload.exp is already a datetime object
+        expires_at = payload.exp if isinstance(payload.exp, datetime) else datetime.fromtimestamp(payload.exp, timezone.utc)
         
-        # Store in revocation list in database
         db.revoke_token(payload.jti, expires_at.isoformat())
         
         return True

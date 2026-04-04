@@ -270,7 +270,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "args": ["-y", "@modelcontextprotocol/server-github"],
         "env_key": "GITHUB_PERSONAL_ACCESS_TOKEN",
         "connector": "github",  # Maps to OAuth connector for per-user tokens
-        "tools": ["create_issue", "create_pull_request", "search_repositories", "get_file_contents"],
+        "tools": [],  # Populated dynamically from MCP discovery
         "requires_auth": True,
     },
     "filesystem": {
@@ -279,7 +279,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Local filesystem access via MCP server",
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-filesystem", "${ALLOWED_DIRS:-/tmp}"],
-        "tools": ["read_file", "write_file", "list_directory", "search_files"],
+        "tools": [],  # Populated dynamically from MCP discovery
         "requires_auth": False,
     },
     "postgres": {
@@ -289,52 +289,70 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-postgres"],
         "env_key": "DATABASE_URL",
-        "tools": ["query", "list_tables", "describe_table"],
+        "tools": [],  # Populated dynamically from MCP discovery
         "requires_auth": True,
     },
     # Example direct API backends
     "openai": {
         "type": "api",
+        "api_type": "rest",
         "name": "OpenAI",
         "description": "OpenAI API direct integration",
         "base_url": "https://api.openai.com/v1",
         "env_key": "OPENAI_API_KEY",
         "connector": "openai",
         "auth_type": "bearer",
-        "tools": ["chat_completions", "embeddings", "image_generation"],
+        "tools": [],  # Populated from connector definitions
         "requires_auth": True,
     },
     "anthropic": {
         "type": "api",
+        "api_type": "rest",
         "name": "Anthropic",
         "description": "Anthropic Claude API direct integration",
         "base_url": "https://api.anthropic.com/v1",
         "env_key": "ANTHROPIC_API_KEY",
         "connector": "anthropic",
         "auth_type": "x-api-key",
-        "tools": ["messages", "token_count"],
+        "tools": [],  # Populated from connector definitions
         "requires_auth": True,
     },
     "slack": {
         "type": "api",
+        "api_type": "rest",
         "name": "Slack",
         "description": "Slack API direct integration",
         "base_url": "https://slack.com/api",
         "env_key": "SLACK_BOT_TOKEN",
         "connector": "slack",
         "auth_type": "bearer",
-        "tools": ["post_message", "list_channels", "get_conversation_history"],
+        "tools": [],  # Populated from connector definitions
         "requires_auth": True,
     },
     "linear": {
         "type": "api",
+        "api_type": "graphql",
         "name": "Linear",
         "description": "Linear API via GraphQL",
         "base_url": "https://api.linear.app/graphql",
         "env_key": "LINEAR_API_KEY",
         "connector": "linear",
         "auth_type": "bearer",
-        "tools": ["create_issue", "search_issues", "update_issue"],
+        "tools": [],  # Populated from connector definitions
         "requires_auth": True,
     },
+}
+
+# Routing configuration: per-service routing preference
+# "connector" = use direct API connector (httpx)
+# "backend" = use MCP server or API backend
+# "auto" = prefer connector, fall back to backend if connector fails
+ROUTING_CONFIG: Dict[str, str] = {
+    "github": "connector",
+    "slack": "connector",
+    "linear": "connector",
+    "openai": "connector",
+    "anthropic": "connector",
+    "filesystem": "backend",
+    "postgres": "backend",
 }

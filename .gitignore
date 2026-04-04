@@ -72,3 +72,4 @@ htmlcov/
 .eggs/
 
 .mcp.json
+.opencode/

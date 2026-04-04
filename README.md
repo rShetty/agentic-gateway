@@ -162,6 +162,8 @@ These endpoints require no authentication - useful for SDK code generation:
 | `POST /v1/call` | Execute a single tool |
 | `POST /v1/batch` | Execute up to 10 tools in one request |
 
+**Note:** Batch calls are limited to 10 tools per request. Each tool in the batch is executed independently and results are returned in order.
+
 ### Authentication Options
 
 1. **API Key** (Simplest for CLIs):
@@ -217,6 +219,19 @@ curl http://localhost:8000/v1/tokens \
 # Response:
 # {"user_id": "api-key-my-cli", "connectors": ["github", "slack"]}
 ```
+
+### Token Management Endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `POST /v1/tokens` | POST | JWT | Store a personal token for a connector |
+| `GET /v1/tokens` | GET | JWT | List your connected connectors |
+| `DELETE /v1/tokens/{connector}` | DELETE | JWT | Remove a stored token |
+
+**Token Resolution Order:**
+1. User's stored token (via `POST /v1/tokens`)
+2. Default user's shared token (stored under "default" user_id)
+3. Environment variable shared credential (set at server startup)
 
 ### Example: Python SDK
 
@@ -441,23 +456,48 @@ This means users can connect their own GitHub/Slack/Linear accounts and make API
 
 ### MCP Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/mcp/backends` | GET | List all backends and their status |
-| `/mcp/backends/{id}/connect` | POST | Connect to a specific backend |
-| `/mcp/tools` | GET | List all available tools |
-| `/mcp/call` | POST | Call a tool on a backend |
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/mcp/backends` | GET | JWT | List all backends and their status |
+| `/mcp/backends/{id}/connect` | POST | JWT | Connect to a specific backend |
+| `/mcp/tools` | GET | JWT | List all available tools |
+| `/mcp/call` | POST | JWT | Call a tool on a backend or connector |
+| `/mcp/connectors` | GET | JWT | List all connectors and their status |
+| `/mcp/connectors/{name}/health` | POST | JWT | Check health of a specific connector |
 
 ### MCP Tools (via FastMCP)
 
-When connected via MCP, the following tools are available:
+When connected via MCP, the gateway provides **dynamic tool discovery** — tools are automatically discovered from all registered connectors and MCP backends at runtime. No hardcoded tool lists needed.
+
+**Gateway Management Tools:**
 
 | Tool | Description |
 |------|-------------|
-| `gateway_list_backends` | List all backend services |
-| `gateway_list_tools` | List all available tools |
-| `gateway_call_tool` | Call a tool on a backend |
-| `gateway_connect_backend` | Connect to a backend |
+| `gateway_list_backends` | List all backend services and their health status |
+| `gateway_list_tools` | List all available tools across connectors and backends |
+| `gateway_call_tool` | Call any discovered tool with proper authentication |
+| `gateway_connect_backend` | Connect to a specific backend |
+| `gateway_auth_status` | Check user's authentication and connected services |
+
+**Dynamically Discovered Tools (39 total):**
+
+| Connector | Tools | Examples |
+|-----------|-------|----------|
+| GitHub | 9 | `github_search_repositories`, `github_get_repository`, `github_list_issues`, `github_create_issue`, `github_list_pull_requests`, `github_create_pull_request`, `github_get_file_contents`, `github_create_or_update_file`, `github_search_code` |
+| Slack | 13 | `slack_post_message`, `slack_update_message`, `slack_delete_message`, `slack_list_channels`, `slack_get_channel_info`, `slack_create_channel`, ... |
+| Linear | 11 | `linear_list_issues`, `linear_create_issue`, `linear_list_projects`, `linear_get_issue`, ... |
+| OpenAI | 4 | `openai_chat_completion`, `openai_embeddings`, `openai_create_image`, `openai_list_models` |
+| Anthropic | 2 | `anthropic_chat_completion`, `anthropic_count_tokens` |
+
+**MCP Discovery Pattern:**
+
+The gateway uses a generic `gateway_call_tool` dispatcher that:
+1. Discovers tools from all registered connectors and MCP backends at startup
+2. Routes tool calls to the appropriate backend/connector automatically
+3. Resolves per-user tokens from the TokenStore for authenticated calls
+4. Falls back to shared credentials if no user token is found
+
+This means new tools are automatically available when you add connectors or connect MCP backends — no code changes needed.
 
 ## Configuration Reference
 

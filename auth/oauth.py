@@ -152,8 +152,38 @@ class JWTManager:
         self.algorithm = algorithm
         self.access_token_expire_minutes = access_token_expire_minutes
         self.refresh_token_expire_days = refresh_token_expire_days
-        # jti -> expiry timestamp; entries are cleaned up lazily on access
-        self._revoked_tokens: Dict[str, float] = {}  # In production, use Redis
+        # jti -> expiry timestamp; cleaned up lazily on decode
+        self._revoked_tokens: Dict[str, float] = {}
+        # Optional Redis sync client for distributed revocation
+        self._redis: Optional[Any] = None
+
+    # ------------------------------------------------------------------
+    # Redis integration (optional — falls back to in-memory gracefully)
+    # ------------------------------------------------------------------
+
+    def configure_redis(self, redis_url: str) -> None:
+        """
+        Configure a Redis connection for distributed JWT revocation.
+
+        When set, ``revoke_token`` writes to Redis in addition to the
+        in-memory dict, and ``is_revoked`` checks Redis as a secondary
+        source.  If Redis becomes unavailable the system degrades
+        gracefully to in-memory-only (fail-open behaviour).
+
+        Args:
+            redis_url: Redis connection URL, e.g. ``redis://localhost:6379``.
+        """
+        try:
+            import redis as redis_lib  # type: ignore[import]
+            client = redis_lib.from_url(redis_url, decode_responses=True, socket_timeout=2)
+            client.ping()
+            self._redis = client
+            logger.info("JWTManager: Redis revocation store connected")
+        except Exception as exc:
+            logger.warning(
+                f"JWTManager: Redis not available for token revocation — "
+                f"using in-memory fallback. ({exc})"
+            )
 
     def create_access_token(
         self,
@@ -213,13 +243,13 @@ class JWTManager:
                 algorithms=[self.algorithm],
             )
             
-            # Check if revoked (also purge expired entries opportunistically)
+            # Purge expired in-memory entries opportunistically, then check revocation
             jti = payload.get("jti")
             now_ts = time.time()
             self._revoked_tokens = {
                 k: v for k, v in self._revoked_tokens.items() if v > now_ts
             }
-            if jti in self._revoked_tokens:
+            if jti and self.is_revoked(jti):
                 logger.warning(f"Attempted use of revoked token: {jti[:8]}...")
                 return None
             
@@ -236,16 +266,43 @@ class JWTManager:
             return None
 
     def revoke_token(self, jti: str, ttl_seconds: Optional[float] = None) -> None:
-        """Revoke a token by its ID. Stores until ttl_seconds from now (defaults to refresh token TTL)."""
+        """
+        Revoke a token by its JTI.
+
+        Writes to the in-memory dict *and* to Redis (if configured) so
+        revocations are shared across multiple gateway instances.
+        TTL defaults to the refresh-token lifetime so the entry auto-expires.
+        """
         if ttl_seconds is None:
             ttl_seconds = self.refresh_token_expire_days * 86400
         self._revoked_tokens[jti] = time.time() + ttl_seconds
+        if self._redis is not None:
+            try:
+                self._redis.setex(f"jwt_revoked:{jti}", int(ttl_seconds), "1")
+            except Exception as exc:
+                logger.warning(
+                    f"Redis revocation write failed (in-memory fallback active): {exc}"
+                )
         logger.info(f"Token revoked: {jti[:8]}...")
 
     def is_revoked(self, jti: str) -> bool:
-        """Check if a token is revoked."""
+        """
+        Return True if *jti* has been revoked.
+
+        Checks in-memory first (fast path), then Redis when configured.
+        A Redis failure is treated as *not-revoked* (fail-open) to avoid
+        locking users out when Redis is temporarily unavailable.
+        """
+        now_ts = time.time()
         entry = self._revoked_tokens.get(jti)
-        return entry is not None and entry > time.time()
+        if entry is not None and entry > now_ts:
+            return True
+        if self._redis is not None:
+            try:
+                return bool(self._redis.exists(f"jwt_revoked:{jti}"))
+            except Exception as exc:
+                logger.warning(f"Redis revocation check failed (fail-open): {exc}")
+        return False
 
 
 # -----------------------------------------------------------------------------

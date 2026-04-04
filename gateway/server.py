@@ -20,15 +20,17 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config.settings import (
     GatewayConfig,
@@ -68,6 +70,30 @@ from connectors import (
 from auth.token_store import get_token_store, set_token_store, AbstractTokenStore
 
 logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Request ID Middleware
+# -----------------------------------------------------------------------------
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """
+    Injects a unique request ID into every request/response.
+
+    - Respects an existing ``X-Request-ID`` header from the caller (for
+      distributed tracing correlation).
+    - Falls back to a freshly generated UUID4 when no caller ID is present.
+    - Echoes the final ID back in the ``X-Request-ID`` response header.
+    - Stores the ID on ``request.state.request_id`` so endpoint handlers and
+      other middleware can log it.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 
 # -----------------------------------------------------------------------------
@@ -371,6 +397,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Request ID tracing — registered after CORS so it wraps the full stack
+app.add_middleware(RequestIDMiddleware)
+
 
 # Normalize all error responses to {"error": "..."} so clients never see
 # FastAPI's default {"detail": "..."} shape mixed with our own shape.
@@ -470,7 +499,8 @@ class TokenRequest(BaseModel):
 @app.post("/oauth/register", tags=["OAuth"])
 async def register_client(req: ClientRegistrationRequest):
     """Register a new OAuth client."""
-    client = state.oauth.register_client(
+    app_state = _get_state()
+    client = app_state.oauth.register_client(
         client_name=req.client_name,
         redirect_uris=req.redirect_uris,
         is_confidential=req.is_confidential,
@@ -546,11 +576,12 @@ async def authorize_page(
 @app.post("/oauth/token", tags=["OAuth"])
 async def token_endpoint(req: TokenRequest):
     """OAuth token endpoint - exchange code for tokens."""
+    app_state = _get_state()
     if req.grant_type == "authorization_code":
         if not req.code or not req.code_verifier:
             raise HTTPException(status_code=400, detail="Missing code or code_verifier")
-        
-        token_pair = state.oauth.exchange_code_for_token(
+
+        token_pair = app_state.oauth.exchange_code_for_token(
             code=req.code,
             code_verifier=req.code_verifier,
             client_id=req.client_id,
@@ -571,9 +602,10 @@ async def token_endpoint(req: TokenRequest):
     elif req.grant_type == "refresh_token":
         if not req.refresh_token:
             raise HTTPException(status_code=400, detail="Missing refresh_token")
-        
-        token_pair = state.oauth.refresh_access_token(
+
+        token_pair = app_state.oauth.refresh_access_token(
             refresh_token=req.refresh_token,
+            client_id=req.client_id,
         )
         
         if not token_pair:
@@ -594,23 +626,25 @@ async def token_endpoint(req: TokenRequest):
 @app.post("/oauth/revoke", tags=["OAuth"])
 async def revoke_token(request: Request):
     """Revoke an access or refresh token."""
+    app_state = _get_state()
     body = await request.json()
     token = body.get("token")
-    
+
     if not token:
         raise HTTPException(status_code=400, detail="Missing token")
-    
-    success = state.oauth.revoke_token(token)
+
+    success = app_state.oauth.revoke_token(token)
     return {"revoked": success}
 
 @app.get("/", tags=["Info"])
 async def root():
     """Gateway info endpoint."""
+    app_state = _get_state()
     return {
-        "name": state.config.server.server_name,
-        "version": state.config.server.server_version,
+        "name": app_state.config.server.server_name,
+        "version": app_state.config.server.server_version,
         "status": "running",
-        "started_at": state.started_at.isoformat(),
+        "started_at": app_state.started_at.isoformat(),
         "endpoints": {
             "oauth": {
                 "register": "/oauth/register",
@@ -647,18 +681,22 @@ async def root():
 @app.get("/health", tags=["Info"])
 async def health():
     """Health check endpoint."""
-    backends_healthy = sum(
-        1 for b in state.backends.list_backends() 
-        if b["status"] == "healthy"
+    app_state = _get_state()
+    backends_info = app_state.backends.list_backends()
+    backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
+    backends_total = len(backends_info)
+    circuit_open = sum(
+        1 for b in backends_info
+        if b.get("circuit_breaker", {}).get("state") == "open"
     )
-    backends_total = len(state.backends._backends)
-    
+
     return {
         "status": "healthy",
-        "uptime_seconds": (datetime.now(timezone.utc) - state.started_at).total_seconds(),
+        "uptime_seconds": (datetime.now(timezone.utc) - app_state.started_at).total_seconds(),
         "backends": {
             "healthy": backends_healthy,
             "total": backends_total,
+            "circuit_open": circuit_open,
         },
     }
 
@@ -934,15 +972,16 @@ async def v1_batch_call(
     ip: str = Depends(get_client_ip),
 ):
     """
-    Execute multiple tool calls in a single request.
-    
-    Maximum 10 tools per batch. Returns results in order.
+    Execute multiple tool calls in parallel and return results in order.
+
+    Maximum 10 tools per batch.  All calls are dispatched concurrently via
+    ``asyncio.gather`` so total wall-clock time is roughly equal to the
+    slowest single call rather than the sum of all calls.
     """
     if len(requests) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 tools per batch")
-    
-    results = []
-    for req in requests:
+
+    async def _run_one(req: V1ToolCallRequest) -> Dict[str, Any]:
         try:
             success, result = await _execute_tool(
                 tool_name=req.tool_name,
@@ -952,17 +991,18 @@ async def v1_batch_call(
                 ip=ip,
             )
             if success:
-                results.append({"tool_name": req.tool_name, "success": True, "result": result})
-            else:
-                results.append({"tool_name": req.tool_name, "success": False, "error": result})
-        except HTTPException as e:
-            results.append({"tool_name": req.tool_name, "success": False, "error": e.detail})
-        except Exception as e:
-            results.append({"tool_name": req.tool_name, "success": False, "error": str(e)})
-    
+                return {"tool_name": req.tool_name, "success": True, "result": result}
+            return {"tool_name": req.tool_name, "success": False, "error": result}
+        except HTTPException as exc:
+            return {"tool_name": req.tool_name, "success": False, "error": exc.detail}
+        except Exception as exc:
+            return {"tool_name": req.tool_name, "success": False, "error": str(exc)}
+
+    results = await asyncio.gather(*[_run_one(req) for req in requests])
+
     return {
         "object": "tool.batch",
-        "results": results,
+        "results": list(results),
         "total": len(results),
     }
 

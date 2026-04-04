@@ -1,0 +1,410 @@
+"""
+Connector Registry for MCP Gateway
+
+Manages all third-party connectors and provides:
+- Connector registration and discovery
+- Tool routing to appropriate connector
+- Health monitoring
+- Credential management
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Type
+
+from .github import BaseConnector, ConnectorConfig, ToolDefinition
+from .github import GitHubConnector
+from .slack import SlackConnector
+from .linear import LinearConnector
+from .ai_providers import OpenAIConnector, AnthropicConnector
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Connector Registry
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ConnectorState:
+    """Runtime state of a connector."""
+    connector: BaseConnector
+    enabled: bool = True
+    healthy: bool = False
+    last_health_check: Optional[datetime] = None
+    total_calls: int = 0
+    total_errors: int = 0
+
+
+class ConnectorRegistry:
+    """
+    Central registry for all third-party connectors.
+    
+    Features:
+    - Auto-discovers tools from all registered connectors
+    - Routes tool calls to the appropriate connector
+    - Manages health checks
+    - Handles credential resolution from environment
+    """
+    
+    # Built-in connector types
+    CONNECTOR_TYPES: Dict[str, Type[BaseConnector]] = {
+        "github": GitHubConnector,
+        "slack": SlackConnector,
+        "linear": LinearConnector,
+        "openai": OpenAIConnector,
+        "anthropic": AnthropicConnector,
+    }
+    
+    # Environment variable mappings for credentials
+    CREDENTIAL_ENV_KEYS: Dict[str, str] = {
+        "github": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "slack": "SLACK_BOT_TOKEN",
+        "linear": "LINEAR_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }
+    
+    def __init__(self, health_check_interval: int = 300):
+        """
+        Initialize the connector registry.
+        
+        Args:
+            health_check_interval: Seconds between health checks (default 5 min)
+        """
+        self._connectors: Dict[str, ConnectorState] = {}
+        self._tool_index: Dict[str, str] = {}  # tool_name -> connector_name
+        self._health_check_interval = health_check_interval
+        self._running = False
+    
+    # -------------------------------------------------------------------------
+    # Connector Registration
+    # -------------------------------------------------------------------------
+    
+    def register_connector(
+        self,
+        name: str,
+        connector: BaseConnector,
+        enabled: bool = True,
+    ) -> None:
+        """
+        Register a connector instance.
+        
+        Args:
+            name: Unique name for this connector
+            connector: Connector instance
+            enabled: Whether the connector is active
+        """
+        if name in self._connectors:
+            logger.warning(f"Connector '{name}' already registered, replacing")
+        
+        self._connectors[name] = ConnectorState(
+            connector=connector,
+            enabled=enabled,
+        )
+        
+        # Index all tools from this connector
+        for tool in connector.get_tools():
+            if tool.name in self._tool_index:
+                logger.warning(
+                    f"Tool '{tool.name}' already registered by '{self._tool_index[tool.name]}', "
+                    f"now also available from '{name}'"
+                )
+            self._tool_index[tool.name] = name
+        
+        logger.info(f"Registered connector '{name}' with {len(connector.get_tools())} tools")
+    
+    def register_from_env(self, name: Optional[str] = None) -> List[str]:
+        """
+        Register connectors from environment variables.
+        
+        Scans for credentials and auto-registers connectors that have them.
+        
+        Args:
+            name: Optional specific connector to register (registers all if None)
+        
+        Returns:
+            List of registered connector names
+        """
+        registered = []
+        
+        for conn_name, conn_class in self.CONNECTOR_TYPES.items():
+            if name and conn_name != name:
+                continue
+            
+            env_key = self.CREDENTIAL_ENV_KEYS.get(conn_name)
+            if not env_key:
+                continue
+            
+            api_key = os.getenv(env_key)
+            if not api_key:
+                logger.debug(f"No credential found for {conn_name} ({env_key})")
+                continue
+            
+            config = ConnectorConfig(api_key=api_key)
+            connector = conn_class(config)
+            self.register_connector(conn_name, connector)
+            registered.append(conn_name)
+        
+        return registered
+    
+    def unregister_connector(self, name: str) -> bool:
+        """
+        Unregister a connector.
+        
+        Args:
+            name: Connector name
+        
+        Returns:
+            True if connector was removed
+        """
+        if name not in self._connectors:
+            return False
+        
+        state = self._connectors[name]
+        
+        # Remove tools from index
+        for tool in state.connector.get_tools():
+            if self._tool_index.get(tool.name) == name:
+                del self._tool_index[tool.name]
+        
+        del self._connectors[name]
+        logger.info(f"Unregistered connector '{name}'")
+        return True
+    
+    def get_connector(self, name: str) -> Optional[BaseConnector]:
+        """Get a connector by name."""
+        state = self._connectors.get(name)
+        return state.connector if state else None
+    
+    def list_connectors(self) -> List[Dict[str, Any]]:
+        """List all registered connectors with their status."""
+        result = []
+        for name, state in self._connectors.items():
+            result.append({
+                "name": name,
+                "display_name": state.connector.display_name,
+                "description": state.connector.description,
+                "enabled": state.enabled,
+                "healthy": state.healthy,
+                "tools": [t.name for t in state.connector.get_tools()],
+                "total_calls": state.total_calls,
+                "total_errors": state.total_errors,
+                "last_health_check": state.last_health_check.isoformat() if state.last_health_check else None,
+            })
+        return result
+    
+    # -------------------------------------------------------------------------
+    # Tool Discovery
+    # -------------------------------------------------------------------------
+    
+    def get_all_tools(self) -> List[Dict[str, Any]]:
+        """Get all tools from all registered connectors."""
+        tools = []
+        seen_names = set()
+        
+        for name, state in self._connectors.items():
+            if not state.enabled:
+                continue
+            
+            for tool in state.connector.get_tools():
+                if tool.name in seen_names:
+                    continue
+                seen_names.add(tool.name)
+                
+                tools.append({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "connector": name,
+                    "requires_auth": tool.requires_auth,
+                })
+        
+        return tools
+    
+    def get_tool_schema(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        """Get JSON Schema for a specific tool."""
+        connector_name = self._tool_index.get(tool_name)
+        if not connector_name:
+            return None
+        
+        state = self._connectors.get(connector_name)
+        if not state:
+            return None
+        
+        for tool in state.connector.get_tools():
+            if tool.name == tool_name:
+                return {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": {
+                        "type": "object",
+                        **tool.parameters,
+                    },
+                }
+        
+        return None
+    
+    # -------------------------------------------------------------------------
+    # Tool Execution
+    # -------------------------------------------------------------------------
+    
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+    ) -> Tuple[bool, Any]:
+        """
+        Call a tool by name.
+        
+        Args:
+            tool_name: Name of the tool to call
+            arguments: Tool arguments
+        
+        Returns:
+            Tuple of (success, result_or_error)
+        """
+        connector_name = self._tool_index.get(tool_name)
+        if not connector_name:
+            return False, {"error": f"Unknown tool: {tool_name}"}
+        
+        state = self._connectors.get(connector_name)
+        if not state:
+            return False, {"error": f"Connector not found: {connector_name}"}
+        
+        if not state.enabled:
+            return False, {"error": f"Connector '{connector_name}' is disabled"}
+        
+        # Execute the tool call
+        try:
+            success, result = await state.connector.call_tool(tool_name, arguments)
+            
+            state.total_calls += 1
+            if not success:
+                state.total_errors += 1
+            
+            return success, result
+            
+        except Exception as e:
+            state.total_errors += 1
+            logger.error(f"Tool call failed: {tool_name}: {e}")
+            return False, {"error": str(e)}
+    
+    # -------------------------------------------------------------------------
+    # Health Monitoring
+    # -------------------------------------------------------------------------
+    
+    async def start_health_checks(self) -> None:
+        """Start background health check loop."""
+        self._running = True
+        asyncio.create_task(self._health_check_loop())
+        logger.info("Started connector health checks")
+    
+    async def stop_health_checks(self) -> None:
+        """Stop health check loop."""
+        self._running = False
+    
+    async def _health_check_loop(self) -> None:
+        """Periodically check connector health."""
+        while self._running:
+            await asyncio.sleep(self._health_check_interval)
+            await self.check_all_health()
+    
+    async def check_all_health(self) -> Dict[str, Tuple[bool, str]]:
+        """Check health of all connectors."""
+        results = {}
+        
+        for name, state in self._connectors.items():
+            if not state.enabled:
+                results[name] = (False, "Disabled")
+                continue
+            
+            try:
+                healthy, message = await state.connector.health_check()
+                state.healthy = healthy
+                state.last_health_check = datetime.utcnow()
+                results[name] = (healthy, message)
+                
+                if healthy:
+                    logger.debug(f"Connector '{name}' is healthy: {message}")
+                else:
+                    logger.warning(f"Connector '{name}' is unhealthy: {message}")
+                    
+            except Exception as e:
+                state.healthy = False
+                state.last_health_check = datetime.utcnow()
+                results[name] = (False, str(e))
+                logger.error(f"Health check failed for '{name}': {e}")
+        
+        return results
+    
+    async def close_all(self) -> None:
+        """Close all connectors."""
+        for name, state in self._connectors.items():
+            try:
+                await state.connector.close()
+            except Exception as e:
+                logger.error(f"Failed to close connector '{name}': {e}")
+
+
+# -----------------------------------------------------------------------------
+# Global Registry Instance
+# -----------------------------------------------------------------------------
+
+_registry: Optional[ConnectorRegistry] = None
+
+
+def get_registry() -> ConnectorRegistry:
+    """Get the global connector registry."""
+    global _registry
+    if _registry is None:
+        _registry = ConnectorRegistry()
+    return _registry
+
+
+async def initialize_connectors() -> ConnectorRegistry:
+    """
+    Initialize the connector registry with connectors from environment.
+    
+    This is the main entry point for setting up connectors.
+    """
+    registry = get_registry()
+    
+    # Register all connectors that have credentials
+    registered = registry.register_from_env()
+    
+    if registered:
+        logger.info(f"Initialized connectors: {', '.join(registered)}")
+    
+    # Start health checks
+    await registry.start_health_checks()
+    
+    return registry
+
+
+# -----------------------------------------------------------------------------
+# Integration with Backend Manager
+# -----------------------------------------------------------------------------
+
+def get_connector_tools() -> List[Dict[str, Any]]:
+    """Get all connector tools in a format suitable for the backend manager."""
+    registry = get_registry()
+    return registry.get_all_tools()
+
+
+async def call_connector_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+) -> Tuple[bool, Any]:
+    """
+    Call a connector tool.
+    
+    This is the main interface for the backend manager to call tools.
+    """
+    registry = get_registry()
+    return await registry.call_tool(tool_name, arguments)

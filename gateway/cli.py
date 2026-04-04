@@ -8,11 +8,7 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 from typing import Optional
-
-# Add parent to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def cmd_serve(args):
@@ -160,6 +156,12 @@ def cmd_call_tool(args):
         print(f"Error: {response.text}")
 
 
+def cmd_mcp_proxy(args):
+    """Run the MCP gateway as a proxy to a backend."""
+    from gateway.server import run_mcp_proxy
+    run_mcp_proxy(backend_id=args.backend)
+
+
 def cmd_generate_pkce(args):
     """Generate PKCE code verifier and challenge."""
     from auth.oauth import generate_code_verifier, generate_code_challenge
@@ -209,6 +211,15 @@ Examples:
     # mcp
     mcp_parser = subparsers.add_parser("mcp", help="Start the MCP server (stdio mode)")
     mcp_parser.set_defaults(func=cmd_mcp)
+    
+    # mcp-proxy
+    proxy_parser = subparsers.add_parser("mcp-proxy", help="Run gateway as MCP proxy to a backend")
+    proxy_parser.add_argument(
+        "--backend", 
+        default="github", 
+        help="Backend ID to proxy to (default: github)"
+    )
+    proxy_parser.set_defaults(func=cmd_mcp_proxy)
     
     # register-client
     reg_parser = subparsers.add_parser("register-client", help="Register an OAuth client")

@@ -20,19 +20,15 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
-
-# Setup path for local imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
     GatewayConfig, 
@@ -49,6 +45,7 @@ from auth.oauth import (
     generate_code_verifier,
     generate_code_challenge,
 )
+from auth.oauth_providers import create_oauth_provider as create_connector_oauth_provider
 from security.middleware import (
     SecurityContext, 
     RateLimiter, 
@@ -67,6 +64,7 @@ from connectors import (
     initialize_connectors,
     get_registry,
 )
+from auth.token_store import get_token_store, set_token_store, AbstractTokenStore
 
 logger = logging.getLogger(__name__)
 
@@ -75,21 +73,150 @@ logger = logging.getLogger(__name__)
 # Application State
 # -----------------------------------------------------------------------------
 
+from auth.oauth_providers import OAuthProvider as ConnectorOAuthProvider
+
 @dataclass
 class AppState:
     """Global application state."""
     config: GatewayConfig
     oauth: OAuthProvider
+    connector_oauth: ConnectorOAuthProvider
     security: SecurityContext
     backends: BackendManager
     connectors: ConnectorRegistry
     started_at: datetime = None
 
     def __post_init__(self):
-        self.started_at = datetime.utcnow()
+        self.started_at = datetime.now(timezone.utc)
 
 
 state: Optional[AppState] = None
+
+
+def _get_state() -> AppState:
+    """Return the global AppState, raising 503 if the server is not yet ready."""
+    if state is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Server not ready")
+    return state
+
+
+def _create_app_state_sync(config: GatewayConfig) -> AppState:
+    """
+    Create AppState synchronously for standalone MCP server mode.
+    
+    This mirrors the lifespan initialization but without async/await.
+    Used when running MCP server without the FastAPI server.
+    """
+    global state
+    
+    if state is not None:
+        return state
+    
+    logger.info("Creating app state for standalone MCP server")
+    
+    # Initialize database-backed OAuth
+    from auth.db_init import create_database_oauth_provider
+    oauth = create_database_oauth_provider(
+        secret_key=config.oauth.jwt_secret_key,
+        access_token_expire_minutes=config.oauth.access_token_expire_minutes,
+        refresh_token_expire_days=config.oauth.refresh_token_expire_days,
+    )
+    
+    # Initialize security
+    audit_logger = AuditLogger(
+        log_path=config.security.audit_log_path,
+        enabled=config.security.audit_enabled,
+        sensitive_fields=config.security.audit_sensitive_fields,
+    )
+    security = SecurityContext(
+        rate_limiter=RateLimiter(
+            requests_per_minute=config.security.rate_limit_requests_per_minute,
+            requests_per_hour=config.security.rate_limit_requests_per_hour,
+        ),
+        validator=InputValidator(
+            max_string_length=config.security.max_string_length,
+            max_request_size=config.security.max_request_size_bytes,
+            sanitize_html=config.security.sanitize_html,
+        ),
+        audit_logger=audit_logger,
+        ip_restrictions=IPRestrictions(
+            whitelist=config.security.ip_whitelist,
+            blacklist=config.security.ip_blacklist,
+        ),
+    )
+    
+    # Initialize backend manager
+    backends = BackendManager(
+        health_check_interval=config.backend.health_check_interval_seconds,
+        unhealthy_threshold=config.backend.unhealthy_threshold,
+    )
+    
+    # Register backends from definitions (synchronous)
+    for backend_id, backend_def in BACKEND_DEFINITIONS.items():
+        definition = BackendDefinition(
+            id=backend_id,
+            name=backend_def["name"],
+            description=backend_def["description"],
+            backend_type=BackendType.MCP_STDIO if backend_def["type"] == "mcp" else BackendType.API_REST,
+            enabled=True,
+            requires_auth=backend_def.get("requires_auth", False),
+            env_key=backend_def.get("env_key"),
+            tools=backend_def.get("tools", []),
+            command=backend_def.get("command"),
+            args=backend_def.get("args", []),
+            env={backend_def["env_key"]: os.getenv(backend_def["env_key"], "")} 
+                if backend_def.get("env_key") else {},
+            url=backend_def.get("url"),
+            base_url=backend_def.get("base_url"),
+            auth_type=backend_def.get("auth_type"),
+        )
+        backends.register_backend(definition)
+    
+    # NOTE: backends.start() is async, skipping for sync mode
+    # In production, would need to run this in event loop
+    
+    # Initialize connectors (sync init)
+    from connectors import ConnectorRegistry, get_registry
+    import asyncio
+    
+    async def init_connectors():
+        from connectors import initialize_connectors
+        return await initialize_connectors()
+    
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is running, we can't run async here
+            connectors = get_registry()
+        else:
+            connectors = loop.run_until_complete(init_connectors())
+    except RuntimeError:
+        # No event loop, create one
+        connectors = asyncio.run(init_connectors())
+    
+    # Initialize connector OAuth provider
+    from auth.oauth_providers import create_oauth_provider as create_connector_oauth_provider
+    connector_oauth = create_connector_oauth_provider(config)
+    
+    # Initialize database-backed token store
+    from auth.db_init import create_database_token_store
+    from auth.token_store import set_token_store
+    token_store = create_database_token_store()
+    set_token_store(token_store)
+    
+    # Store state
+    state = AppState(
+        config=config,
+        oauth=oauth,
+        connector_oauth=connector_oauth,
+        security=security,
+        backends=backends,
+        connectors=connectors,
+    )
+    
+    logger.info("App state created successfully")
+    return state
 
 
 # -----------------------------------------------------------------------------
@@ -104,8 +231,9 @@ async def lifespan(app: FastAPI):
     # Startup
     config = get_config()
     
-    # Initialize OAuth
-    oauth = create_oauth_provider(
+    # Initialize database-backed OAuth
+    from auth.db_init import create_database_oauth_provider
+    oauth = create_database_oauth_provider(
         secret_key=config.oauth.jwt_secret_key,
         access_token_expire_minutes=config.oauth.access_token_expire_minutes,
         refresh_token_expire_days=config.oauth.refresh_token_expire_days,
@@ -166,10 +294,19 @@ async def lifespan(app: FastAPI):
     # Initialize connectors from environment
     connectors = await initialize_connectors()
     
+    # Initialize connector OAuth provider
+    connector_oauth = create_connector_oauth_provider(config)
+    
+    # Initialize database-backed token store for third-party tokens
+    from auth.db_init import create_database_token_store
+    token_store = create_database_token_store()
+    set_token_store(token_store)
+    
     # Store state
     state = AppState(
         config=config,
         oauth=oauth,
+        connector_oauth=connector_oauth,
         security=security,
         backends=backends,
         connectors=connectors,
@@ -196,14 +333,34 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware.
+# allow_credentials=True is incompatible with allow_origins=["*"] (CORS spec).
+# In development we allow all origins but disable credentials; in production
+# use an explicit origin list from config so credentials can be enabled.
+_startup_config = get_config()
+_cors_origins = _startup_config.server.cors_origins
+_cors_credentials = "*" not in _cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# Normalize all error responses to {"error": "..."} so clients never see
+# FastAPI's default {"detail": "..."} shape mixed with our own shape.
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(f"Unhandled exception on {request.method} {request.url.path}")
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
 # -----------------------------------------------------------------------------
@@ -238,10 +395,22 @@ async def get_current_user(
 
 
 async def get_client_ip(request: Request) -> str:
-    """Extract client IP from request."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """
+    Extract client IP from request.
+
+    X-Forwarded-For is only trusted when the gateway is explicitly configured
+    to run behind a reverse proxy (TRUSTED_PROXY env var set to "1").
+    When trusted, we take the *last* IP added by a trusted upstream proxy
+    (rightmost entry), not the leftmost which is client-controlled.
+    Without proxy trust, fall back to the direct TCP peer address.
+    """
+    if os.getenv("TRUSTED_PROXY") == "1":
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            # Rightmost entry is added by our trusted proxy
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -298,39 +467,36 @@ async def authorize_page(
     code_challenge: str,
     code_challenge_method: str = "S256",
     scope: str = "mcp:tools",
-    state: Optional[str] = None,
+    oauth_state: Optional[str] = None,  # renamed — avoids shadowing the global AppState
 ):
     """
     OAuth authorization endpoint - shows consent page.
-    
+
     For POC, auto-approves. In production, show UI for user consent.
     """
+    app_state = _get_state()
+
     # Validate client and redirect URI
-    client = state.oauth.get_client(client_id)
+    client = app_state.oauth.get_client(client_id)
     if not client:
         raise HTTPException(status_code=400, detail="Invalid client_id")
-    
-    if not state.oauth.validate_redirect_uri(client_id, redirect_uri):
+
+    if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
-    
+
     # For POC: auto-approve and redirect
     # In production: render consent page, get user approval
-    code = state.oauth.create_authorization_code(
+    code = app_state.oauth.create_authorization_code(
         client_id=client_id,
         redirect_uri=redirect_uri,
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
         scope=scope,
     )
-    
-    # Build redirect URL
-    redirect_url = f"{redirect_uri}?code={code}"
-    if state:
-        redirect_url += f"&state={state}"
-    
+
     # Log the authorization
-    if state.security.audit:
-        state.security.audit.log(
+    if app_state.security.audit:
+        app_state.security.audit.log(
             event_type="oauth_authorize",
             client_id=client_id,
             user_id="demo_user",
@@ -340,13 +506,17 @@ async def authorize_page(
             success=True,
             details={"scope": scope},
         )
-    
+
     # For POC: return JSON with redirect info
     # In production: return HTMLResponse with consent page or redirect
+    redirect_url = f"{redirect_uri}?code={code}"
+    if oauth_state:
+        redirect_url += f"&state={oauth_state}"
+
     return {
         "code": code,
         "redirect_uri": redirect_uri,
-        "state": state,
+        "state": oauth_state,
         "message": "Authorization granted (auto-approved for POC)",
     }
 
@@ -412,11 +582,6 @@ async def revoke_token(request: Request):
     success = state.oauth.revoke_token(token)
     return {"revoked": success}
 
-
-# -----------------------------------------------------------------------------
-# MCP Gateway Endpoints
-# -----------------------------------------------------------------------------
-
 @app.get("/", tags=["Info"])
 async def root():
     """Gateway info endpoint."""
@@ -469,7 +634,7 @@ async def health():
     
     return {
         "status": "healthy",
-        "uptime_seconds": (datetime.utcnow() - state.started_at).total_seconds(),
+        "uptime_seconds": (datetime.now(timezone.utc) - state.started_at).total_seconds(),
         "backends": {
             "healthy": backends_healthy,
             "total": backends_total,
@@ -714,52 +879,17 @@ async def v1_call_tool(
     Supports both OAuth Bearer tokens and simple API keys.
     
     Example:
-        curl -X POST https://gateway/v1/call \\
-          -H "Authorization: Bearer sk-xxx" \\
-          -H "Content-Type: application/json" \\
+        curl -X POST https://gateway/v1/call \
+          -H "Authorization: Bearer sk-xxx" \
+          -H "Content-Type: application/json" \
           -d '{"tool_name": "github_search_repositories", "arguments": {"query": "mcp"}}'
     """
-    # Security check
-    allowed, info = state.security.check_request(
-        client_id=user["client_id"],
-        ip_address=ip,
-        user_id=user["user_id"],
-    )
-    if not allowed:
-        raise HTTPException(status_code=429, detail=info)
-    
-    # Validate and sanitize arguments
-    valid, sanitized = state.security.validate_and_sanitize(
+    success, result = await _execute_tool(
         tool_name=req.tool_name,
         arguments=req.arguments,
-    )
-    if not valid:
-        raise HTTPException(status_code=400, detail=sanitized)
-    
-    # First try connector tools
-    connector_name = state.connectors._tool_index.get(req.tool_name)
-    if connector_name:
-        success, result = await state.connectors.call_tool(
-            tool_name=req.tool_name,
-            arguments=sanitized,
-        )
-    else:
-        # Fall back to backend tools
-        success, result = await state.backends.call_tool(
-            tool_name=req.tool_name,
-            arguments=sanitized,
-            timeout=req.timeout,
-        )
-    
-    # Audit log
-    state.security.log_tool_call(
-        client_id=user["client_id"],
-        user_id=user["user_id"],
-        ip_address=ip,
-        tool_name=req.tool_name,
-        arguments=req.arguments,
-        success=success,
-        result_summary=str(result)[:200] if result else None,
+        timeout=req.timeout,
+        user=user,
+        ip=ip,
     )
     
     if not success:
@@ -793,25 +923,21 @@ async def v1_batch_call(
     results = []
     for req in requests:
         try:
-            # Reuse single tool call logic
-            result = await v1_call_tool(req, user, ip)
-            results.append({
-                "tool_name": req.tool_name,
-                "success": True,
-                "result": result.get("result"),
-            })
+            success, result = await _execute_tool(
+                tool_name=req.tool_name,
+                arguments=req.arguments,
+                timeout=req.timeout,
+                user=user,
+                ip=ip,
+            )
+            if success:
+                results.append({"tool_name": req.tool_name, "success": True, "result": result})
+            else:
+                results.append({"tool_name": req.tool_name, "success": False, "error": result})
         except HTTPException as e:
-            results.append({
-                "tool_name": req.tool_name,
-                "success": False,
-                "error": e.detail,
-            })
+            results.append({"tool_name": req.tool_name, "success": False, "error": e.detail})
         except Exception as e:
-            results.append({
-                "tool_name": req.tool_name,
-                "success": False,
-                "error": str(e),
-            })
+            results.append({"tool_name": req.tool_name, "success": False, "error": str(e)})
     
     return {
         "object": "tool.batch",
@@ -852,14 +978,21 @@ class ToolCallRequest(BaseModel):
     timeout: int = 120
 
 
-@app.post("/mcp/call", tags=["MCP Compatible"])
-async def call_tool(
-    req: ToolCallRequest,
-    user: Dict = Depends(get_current_user),
-    ip: str = Depends(get_client_ip),
-):
-    """Call a tool on a backend or connector."""
-    # Security check
+async def _execute_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout: int,
+    user: Dict[str, Any],
+    ip: str,
+    backend_id: Optional[str] = None,
+) -> Tuple[bool, Any]:
+    """
+    Shared tool execution logic for both v1 and mcp endpoints.
+
+    Token resolution order (per-user credential takes priority):
+    1. Look up a user-specific token in the TokenStore for the connector.
+    2. Fall back to the shared env-var credential registered at startup.
+    """
     allowed, info = state.security.check_request(
         client_id=user["client_id"],
         ip_address=ip,
@@ -867,40 +1000,448 @@ async def call_tool(
     )
     if not allowed:
         raise HTTPException(status_code=429, detail=info)
-    
-    # Validate and sanitize arguments
+
     valid, sanitized = state.security.validate_and_sanitize(
-        tool_name=req.tool_name,
-        arguments=req.arguments,
+        tool_name=tool_name,
+        arguments=arguments,
     )
     if not valid:
         raise HTTPException(status_code=400, detail=sanitized)
+
+    connector_name = state.connectors._tool_index.get(tool_name)
     
-    # First try connector tools
-    connector_name = state.connectors._tool_index.get(req.tool_name)
+    # Determine if this is a connector tool or backend tool
+    # and resolve the appropriate token
+    user_token = None
+    
     if connector_name:
+        # Connector tool - use connector-specific token
+        jwt_user_id = user["user_id"]
+        
+        # Try JWT user first, then fall back to "default" user
+        user_token = await get_token_store().get_token(jwt_user_id, connector_name)
+        if not user_token:
+            user_token = await get_token_store().get_token("default", connector_name)
+        
+        if not user_token:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"No credentials configured for '{connector_name}'. Set {connector_name.upper()}_PERSONAL_ACCESS_TOKEN as an environment variable (shared), or store your personal token via POST /v1/tokens."},
+            )
+        
         success, result = await state.connectors.call_tool(
-            tool_name=req.tool_name,
+            tool_name=tool_name,
             arguments=sanitized,
+            user_token=user_token,
         )
     else:
-        # Fall back to backend tools
+        # Backend tool - check if backend has OAuth connector mapping
+        backend_id = backend_id or state.backends._tool_index.get(tool_name)
+        
+        if backend_id:
+            # Check if this backend has a connector mapping for OAuth
+            backend_state = state.backends._backends.get(backend_id)
+            if backend_state and backend_state.definition.connector:
+                # Backend supports OAuth - get per-user token
+                connector_name = backend_state.definition.connector
+                jwt_user_id = user["user_id"]
+                
+                user_token = await get_token_store().get_token(jwt_user_id, connector_name)
+                if not user_token:
+                    user_token = await get_token_store().get_token("default", connector_name)
+                
+                if not user_token:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": f"No credentials configured for '{connector_name}'. Set {connector_name.upper()}_PERSONAL_ACCESS_TOKEN as an environment variable (shared), or store your personal token via POST /v1/tokens."},
+                    )
+        
         success, result = await state.backends.call_tool(
-            tool_name=req.tool_name,
+            tool_name=tool_name,
             arguments=sanitized,
-            backend_id=req.backend_id,
-            timeout=req.timeout,
+            backend_id=backend_id,
+            timeout=timeout,
+            user_token=user_token,
         )
-    
-    # Audit log
+
     state.security.log_tool_call(
         client_id=user["client_id"],
         user_id=user["user_id"],
         ip_address=ip,
-        tool_name=req.tool_name,
-        arguments=req.arguments,
+        tool_name=tool_name,
+        arguments=arguments,
         success=success,
         result_summary=str(result)[:200] if result else None,
+    )
+
+    return success, result
+
+
+# -----------------------------------------------------------------------------
+# Per-User Token Management Endpoints
+# -----------------------------------------------------------------------------
+
+class UserTokenRequest(BaseModel):
+    """Request body for storing a per-user backend token."""
+    connector_name: str
+    token: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+# Connector OAuth configurations
+CONNECTOR_OAUTH_CONFIGS = {
+    "github": {
+        "name": "GitHub",
+        "color": "#24292e",
+        "icon": "🐙",
+        "description": "Access repositories, issues, and pull requests",
+    },
+    "slack": {
+        "name": "Slack",
+        "color": "#4A154B",
+        "icon": "💬",
+        "description": "Send messages and manage channels",
+    },
+    "linear": {
+        "name": "Linear",
+        "color": "#5E6AD2",
+        "icon": "📋",
+        "description": "Issue tracking and project management",
+    },
+}
+
+
+@app.get("/connectors", tags=["Token Management"])
+async def connectors_page(
+    error: Optional[str] = None,
+    success: Optional[str] = None,
+):
+    """
+    Connectors listing page - shows all available connectors with Connect buttons.
+    
+    Clicking Connect redirects to the service's OAuth flow.
+    """
+    # Check which connectors are already connected
+    connected = []
+    for conn in CONNECTOR_OAUTH_CONFIGS:
+        # For now, check if there's a token in the store
+        pass
+    
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Connect Services</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f6f8fa; margin: 0; padding: 40px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { color: #24292e; margin-bottom: 8px; }
+        .subtitle { color: #586069; margin-bottom: 32px; }
+        .error { background: #ffeef0; color: #cb2431; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; }
+        .success { background: #dcffe4; color: #22863a; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; }
+        .connectors-grid { display: grid; gap: 16px; }
+        .connector-card { background: white; border: 1px solid #e1e4e8; border-radius: 6px; padding: 20px; display: flex; align-items: center; gap: 16px; }
+        .connector-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .connector-icon { font-size: 32px; width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; }
+        .connector-info { flex: 1; }
+        .connector-name { font-size: 18px; font-weight: 600; color: #24292e; margin: 0 0 4px 0; }
+        .connector-desc { color: #586069; margin: 0; font-size: 14px; }
+        .connect-btn { background: #2ea44f; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; text-decoration: none; display: inline-block; }
+        .connect-btn:hover { background: #2c974b; }
+        .connected-btn { background: #e1e4e8; color: #586069; cursor: default; }
+        .connected-badge { background: #dcffe4; color: #22863a; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Connect Your Services</h1>
+        <p class="subtitle">Link your accounts to enable tool access through the gateway.</p>
+        
+        """ + (f'<div class="error">' + error + '</div>' if error else '') + """
+        """ + (f'<div class="success">' + success + '</div>' if success else '') + """
+        
+        <div class="connectors-grid">
+"""
+    
+    for conn_id, conn_config in CONNECTOR_OAUTH_CONFIGS.items():
+        html += f"""
+            <div class="connector-card">
+                <div class="connector-icon">{conn_config['icon']}</div>
+                <div class="connector-info">
+                    <h3 class="connector-name">{conn_config['name']}</h3>
+                    <p class="connector-desc">{conn_config['description']}</p>
+                </div>
+                <a href="/oauth/authorize/{conn_id}" class="connect-btn">Connect</a>
+            </div>
+"""
+    
+    html += """
+        </div>
+        
+        <p style="margin-top: 32px; color: #586069; font-size: 14px;">
+            <a href="/docs">View API Documentation</a>
+        </p>
+    </div>
+</body>
+</html>"""
+    
+    return HTMLResponse(content=html)
+
+
+@app.get("/oauth/authorize/{connector}", tags=["OAuth"])
+async def oauth_authorize(connector: str):
+    """
+    Start OAuth flow for a connector.
+    
+    Redirects to the service's OAuth authorization page.
+    """
+    app_state = _get_state()
+    
+    if connector not in CONNECTOR_OAUTH_CONFIGS:
+        raise HTTPException(status_code=404, detail=f"Unknown connector: {connector}")
+    
+    # Check if OAuth is configured
+    if connector == "github":
+        if not app_state.config.github_oauth.client_id:
+            return HTMLResponse(
+                content=f"""<html><body>
+                    <h1>GitHub OAuth Not Configured</h1>
+                    <p>Please set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET environment variables.</p>
+                    <p><a href="/connectors">Back to Connectors</a></p>
+                </body></html>""",
+                status_code=501,
+            )
+        auth_url = app_state.connector_oauth.get_github_auth_url(
+            state=app_state.connector_oauth.create_state(connector)
+        )
+    elif connector == "slack":
+        if not app_state.config.slack_oauth.client_id:
+            return HTMLResponse(
+                content=f"""<html><body>
+                    <h1>Slack OAuth Not Configured</h1>
+                    <p>Please set SLACK_OAUTH_CLIENT_ID and SLACK_OAUTH_CLIENT_SECRET environment variables.</p>
+                    <p><a href="/connectors">Back to Connectors</a></p>
+                </body></html>""",
+                status_code=501,
+            )
+        auth_url = app_state.connector_oauth.get_slack_auth_url(
+            state=app_state.connector_oauth.create_state(connector)
+        )
+    elif connector == "linear":
+        if not app_state.config.linear_oauth.client_id:
+            return HTMLResponse(
+                content=f"""<html><body>
+                    <h1>Linear OAuth Not Configured</h1>
+                    <p>Please set LINEAR_OAUTH_CLIENT_ID and LINEAR_OAUTH_CLIENT_SECRET environment variables.</p>
+                    <p><a href="/connectors">Back to Connectors</a></p>
+                </body></html>""",
+                status_code=501,
+            )
+        auth_url = app_state.connector_oauth.get_linear_auth_url(
+            state=app_state.connector_oauth.create_state(connector)
+        )
+    else:
+        raise HTTPException(status_code=404, detail=f"Unknown connector: {connector}")
+    
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/oauth/github/callback", tags=["OAuth"])
+async def github_callback(code: str, state: str):
+    """Handle GitHub OAuth callback."""
+    app_state = _get_state()
+    
+    # Validate state
+    state_data = app_state.connector_oauth.validate_state(state)
+    if not state_data:
+        return HTMLResponse(
+            content="<html><body><h1>Invalid State</h1><p>The OAuth state is invalid or expired. <a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    # Exchange code for token
+    oauth_user = await app_state.connector_oauth.exchange_github_code(code)
+    if not oauth_user:
+        return HTMLResponse(
+            content="<html><body><h1>Authentication Failed</h1><p>Could not obtain access token from GitHub. <a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    # Store token (using user ID from OAuth)
+    user_id = oauth_user.id
+    app_state.connector_oauth.store_token("github", user_id, oauth_user)
+    
+    # Store in the main token store
+    # Store with both GitHub user ID and a common "default" key for easy lookup
+    await get_token_store().set_token(
+        user_id=user_id,
+        connector_name="github",
+        token=oauth_user.access_token,
+    )
+    # Also store with a default key for users without established JWT identity
+    await get_token_store().set_token(
+        user_id="default",
+        connector_name="github",
+        token=oauth_user.access_token,
+    )
+    
+    return HTMLResponse(content=f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Connected</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }}
+        .success {{ background: #dcffe4; color: #22863a; padding: 16px; border-radius: 6px; }}
+        a {{ color: #0366d6; }}
+    </style>
+</head>
+<body>
+    <div class="success">
+        <h1>GitHub Connected!</h1>
+        <p>Welcome, {oauth_user.name or oauth_user.login}!</p>
+        <p>Your GitHub account is now linked.</p>
+    </div>
+    <p><a href="/connectors">Back to Connectors</a> | <a href="/docs">API Docs</a></p>
+</body>
+</html>""")
+
+
+@app.get("/oauth/slack/callback", tags=["OAuth"])
+async def slack_callback(code: str, state: str):
+    """Handle Slack OAuth callback."""
+    app_state = _get_state()
+    
+    state_data = app_state.connector_oauth.validate_state(state)
+    if not state_data:
+        return HTMLResponse(
+            content="<html><body><h1>Invalid State</h1><p><a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    oauth_user = await app_state.connector_oauth.exchange_slack_code(code)
+    if not oauth_user:
+        return HTMLResponse(
+            content="<html><body><h1>Authentication Failed</h1><p><a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    user_id = oauth_user.id
+    app_state.connector_oauth.store_token("slack", user_id, oauth_user)
+    
+    return HTMLResponse(content=f"""<!DOCTYPE html>
+<html>
+<head><title>Slack Connected</title></head>
+<body>
+    <div class="success">
+        <h1>Slack Connected!</h1>
+        <p>Welcome!</p>
+    </div>
+    <p><a href="/connectors">Back to Connectors</a></p>
+</body>
+</html>""")
+
+
+@app.get("/oauth/linear/callback", tags=["OAuth"])
+async def linear_callback(code: str, state: str):
+    """Handle Linear OAuth callback."""
+    app_state = _get_state()
+    
+    state_data = app_state.connector_oauth.validate_state(state)
+    if not state_data:
+        return HTMLResponse(
+            content="<html><body><h1>Invalid State</h1><p><a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    oauth_user = await app_state.connector_oauth.exchange_linear_code(code)
+    if not oauth_user:
+        return HTMLResponse(
+            content="<html><body><h1>Authentication Failed</h1><p><a href='/connectors'>Try again</a></p></body></html>",
+            status_code=400,
+        )
+    
+    user_id = oauth_user.id
+    app_state.connector_oauth.store_token("linear", user_id, oauth_user)
+    
+    return HTMLResponse(content=f"""<!DOCTYPE html>
+<html>
+<head><title>Linear Connected</title></head>
+<body>
+    <div class="success">
+        <h1>Linear Connected!</h1>
+        <p>Welcome, {oauth_user.name}!</p>
+    </div>
+    <p><a href="/connectors">Back to Connectors</a></p>
+</body>
+</html>""")
+
+
+@app.post("/v1/tokens", tags=["Token Management"])
+async def store_user_token(
+    req: UserTokenRequest,
+    user: Dict = Depends(get_current_user_api_key),
+):
+    """
+    Store a personal API token for a backend connector.
+
+    This allows each authenticated user to supply their own credentials for
+    connectors like GitHub, Slack, Linear, etc., so that tool calls are made
+    on their behalf rather than using the shared service-account credentials.
+
+    Example:
+        curl -X POST https://gateway/v1/tokens \\
+          -H "Authorization: Bearer <your_gateway_token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"connector_name": "github", "token": "ghp_your_token"}'
+    """
+    if req.connector_name not in state.connectors.CONNECTOR_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown connector: {req.connector_name}. "
+                   f"Valid connectors: {list(state.connectors.CONNECTOR_TYPES.keys())}",
+        )
+    await get_token_store().set_token(
+        user_id=user["user_id"],
+        connector_name=req.connector_name,
+        token=req.token,
+        metadata=req.metadata,
+    )
+    return {"stored": True, "connector": req.connector_name, "user_id": user["user_id"]}
+
+
+@app.get("/v1/tokens", tags=["Token Management"])
+async def list_user_tokens(user: Dict = Depends(get_current_user_api_key)):
+    """List connectors for which the current user has stored a token."""
+    connectors = await get_token_store().list_connectors_for_user(user["user_id"])
+    return {"user_id": user["user_id"], "connectors": connectors}
+
+
+@app.delete("/v1/tokens/{connector_name}", tags=["Token Management"])
+async def delete_user_token(
+    connector_name: str,
+    user: Dict = Depends(get_current_user_api_key),
+):
+    """Remove the stored token for a connector."""
+    removed = await get_token_store().delete_token(user["user_id"], connector_name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No token found for connector: {connector_name}")
+    return {"deleted": True, "connector": connector_name}
+
+
+@app.post("/mcp/call", tags=["MCP Compatible"])
+async def call_tool(
+    req: ToolCallRequest,
+    user: Dict = Depends(get_current_user),
+    ip: str = Depends(get_client_ip),
+):
+    """Call a tool on a backend or connector."""
+    success, result = await _execute_tool(
+        tool_name=req.tool_name,
+        arguments=req.arguments,
+        timeout=req.timeout,
+        user=user,
+        ip=ip,
+        backend_id=req.backend_id,
     )
     
     if not success:
@@ -916,12 +1457,278 @@ async def call_tool(
 # MCP Server (FastMCP Integration)
 # -----------------------------------------------------------------------------
 
-def create_mcp_server():
+def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool = True) -> Optional[Any]:
     """
-    Create an MCP server using FastMCP.
+    Create an MCP server using FastMCP that proxies to registered backends.
     
-    This is what MCP clients (Cursor, Claude Code) connect to.
-    The gateway acts as an MCP server that proxies to backends.
+    This creates an MCP server that Cursor/Claude Code can connect to.
+    It dynamically discovers tools from MCP backends and exposes them.
+    
+    The server uses OAuth 2.1 JWT authentication:
+    - MCP client must initialize with a valid JWT access token
+    - Tool calls use the user's stored third-party tokens
+    
+    Args:
+        app_state: Application state with backends and connectors. If None, uses global state.
+        init_state: If True and global state is None, initialize it (for standalone MCP mode).
+    """
+    global state
+    
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:
+        logger.error("MCP SDK not installed. Run: pip install mcp")
+        return None
+    
+    config = get_config()
+    
+    # Use provided state or fall back to global state
+    if app_state is None:
+        if state is None and init_state:
+            logger.info("Initializing state for standalone MCP server")
+            app_state = _create_app_state_sync(config)
+        else:
+            app_state = state
+    
+    if app_state is None:
+        logger.error("Cannot create MCP server: app_state is None. Ensure server is running or init_state=True")
+        return None
+    
+    # Get MCP server settings from config
+    mcp_host = config.server.mcp_host
+    mcp_port = config.server.mcp_port
+    
+    # Create auth callback for OAuth 2.1 JWT validation
+    async def mcp_auth_callback(token: str) -> Optional[dict]:
+        """
+        Validate JWT token from MCP client initialization.
+        
+        The MCP client passes their JWT access token during initialize.
+        We validate it and return user info for tool calls.
+        """
+        if not token:
+            return None
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            logger.warning("MCP auth: invalid or expired JWT")
+            return None
+        logger.info(f"MCP auth: validated user {user_info.get('user_id')}")
+        return user_info
+    
+    mcp = FastMCP(
+        config.server.server_name,
+        instructions=config.server.server_instructions + "\n\n" +
+            "Authentication: This server requires OAuth 2.1 JWT access token. " +
+            "Clients must obtain a token from the gateway's /oauth/token endpoint " +
+            "and pass it during MCP initialization.",
+        host=mcp_host,
+        port=mcp_port,
+        mount_path="/mcp",
+        streamable_http_path="/mcp",
+        sse_path="/sse",
+        message_path="/messages/",
+    )
+    
+    # Set auth callback (FastMCP will call this during initialization)
+    # The token is passed in the initialize request's headers or auth field
+    # We'll handle this via the tool that requires auth
+    
+    @mcp.tool()
+    def gateway_list_backends(authorization: str = None) -> str:
+        """List all available backend services.
+        
+        Args:
+            authorization: JWT access token for authentication (Bearer <token>)
+        """
+        # Validate auth
+        if not authorization:
+            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
+        if not authorization.startswith("Bearer "):
+            return json.dumps({"error": "Invalid Authorization format", "hint": "Use: Bearer <jwt_token>"})
+        
+        token = authorization[7:]
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
+        
+        return json.dumps(app_state.backends.list_backends(), indent=2)
+
+    @mcp.tool()
+    def gateway_list_tools(authorization: str = None) -> str:
+        """List all available tools across backends and connectors.
+        
+        Args:
+            authorization: JWT access token for authentication (Bearer <token>)
+        """
+        # Validate auth
+        if not authorization:
+            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
+        if not authorization.startswith("Bearer "):
+            return json.dumps({"error": "Invalid Authorization format", "hint": "Use: Bearer <jwt_token>"})
+        
+        token = authorization[7:]
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
+        
+        backend_tools = app_state.backends.list_tools()
+        connector_tools = app_state.connectors.get_all_tools()
+        all_tools = backend_tools + connector_tools
+        return json.dumps(all_tools, indent=2)
+
+    @mcp.tool()
+    async def gateway_connect_backend(backend_id: str, authorization: str = None) -> str:
+        """Connect to a backend service.
+        
+        Args:
+            backend_id: ID of the backend to connect
+            authorization: JWT access token for authentication
+        """
+        # Validate auth
+        if not authorization or not authorization.startswith("Bearer "):
+            return json.dumps({"error": "Missing Authorization header"})
+        
+        token = authorization[7:]
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            return json.dumps({"error": "Invalid or expired token"})
+        
+        success, error = await app_state.backends.connect_backend(backend_id)
+        if not success:
+            return json.dumps({"error": error})
+        return json.dumps({"connected": backend_id})
+
+    @mcp.tool()
+    async def gateway_auth_status(authorization: str = None) -> str:
+        """Check authentication and third-party connection status.
+        
+        Returns the user's OAuth status and connected third-party services.
+        
+        Args:
+            authorization: JWT access token for authentication
+        """
+        # Validate auth
+        if not authorization or not authorization.startswith("Bearer "):
+            return json.dumps({"error": "Missing Authorization header"})
+        
+        token = authorization[7:]
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            return json.dumps({"error": "Invalid or expired token"})
+        
+        user_id = user_info.get("user_id")
+        
+        # Get list of connected third-party tokens
+        from auth.token_store import get_token_store
+        connected = await get_token_store().list_connectors_for_user(user_id)
+        
+        return json.dumps({
+            "user_id": user_id,
+            "connected_services": connected,
+            "auth_endpoint": "http://localhost:8000/oauth/authorize/{connector}",
+            "token_endpoint": "http://localhost:8000/oauth/token"
+        }, indent=2)
+
+    @mcp.tool()
+    async def gateway_call_tool(
+        tool_name: str,
+        arguments: str = "{}",
+        authorization: str = None,
+        backend_id: str = None
+    ) -> str:
+        """Call a tool on a backend or connector.
+        
+        Args:
+            tool_name: Name of the tool to call
+            arguments: JSON string of arguments
+            authorization: JWT access token for authentication
+            backend_id: Optional backend ID (for MCP backends)
+        """
+        # Validate auth
+        if not authorization or not authorization.startswith("Bearer "):
+            return json.dumps({"error": "Missing Authorization header", "hint": "Pass JWT access token"})
+        
+        token = authorization[7:]
+        user_info = app_state.oauth.validate_access_token(token)
+        if not user_info:
+            return json.dumps({"error": "Invalid or expired token", "hint": "Get new token from /oauth/token"})
+        
+        # Parse arguments
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except json.JSONDecodeError:
+            return json.dumps({"error": "Invalid JSON in arguments"})
+        
+        user_id = user_info.get("user_id")
+        
+        # Determine if this is a connector tool or backend tool
+        # and resolve the appropriate token
+        from auth.token_store import get_token_store
+        user_token = None
+        
+        connector_name = app_state.connectors._tool_index.get(tool_name)
+        
+        if connector_name:
+            # Connector tool - use connector-specific token
+            user_token = await get_token_store().get_token(user_id, connector_name)
+            
+            if not user_token:
+                return json.dumps({
+                    "error": f"Not authenticated with {connector_name}",
+                    "hint": f"Visit http://localhost:8000/oauth/authorize/{connector_name} to connect",
+                    "connector": connector_name
+                })
+            
+            # Call connector tool with user's token
+            success, result = await app_state.connectors.call_tool(
+                tool_name=tool_name,
+                arguments=args,
+                user_token=user_token,
+            )
+        else:
+            # Backend tool - check if backend has OAuth connector mapping
+            backend_id = backend_id or app_state.backends._tool_index.get(tool_name)
+            
+            if backend_id:
+                # Check if this backend has a connector mapping for OAuth
+                backend_state = app_state.backends._backends.get(backend_id)
+                if backend_state and backend_state.definition.connector:
+                    # Backend supports OAuth - get per-user token
+                    connector_name = backend_state.definition.connector
+                    
+                    user_token = await get_token_store().get_token(user_id, connector_name)
+                    
+                    if not user_token:
+                        return json.dumps({
+                            "error": f"Not authenticated with {connector_name}",
+                            "hint": f"Visit http://localhost:8000/oauth/authorize/{connector_name} to connect",
+                            "connector": connector_name
+                        })
+            
+            # Call backend tool (with user_token if available)
+            success, result = await app_state.backends.call_tool(
+                tool_name=tool_name,
+                arguments=args,
+                backend_id=backend_id,
+                user_token=user_token,
+            )
+        
+        if not success:
+            return json.dumps({"error": result})
+        return json.dumps({"result": result}, indent=2)
+
+    return mcp
+
+
+def create_proxy_mcp_server(backend_id: str = "github") -> Optional[Any]:
+    """
+    Create an MCP server that proxies directly to a specific MCP backend.
+    
+    This is useful when you want Cursor to connect directly to the gateway
+    and have it proxy all MCP calls to the underlying MCP server.
+    
+    Args:
+        backend_id: The backend to proxy to (default: github)
     """
     try:
         from mcp.server.fastmcp import FastMCP
@@ -931,69 +1738,138 @@ def create_mcp_server():
     
     config = get_config()
     
+    def get_backend_tools():
+        """Get tools from the backend."""
+        return state.backends.list_tools()
+    
     mcp = FastMCP(
-        config.server.server_name,
-        instructions=config.server.server_instructions,
+        f"mcp-gateway-{backend_id}",
+        instructions=f"MCP Gateway proxying to {backend_id} backend",
     )
-    
+
     @mcp.tool()
-    def gateway_list_backends() -> str:
-        """List all available backend services."""
-        backends = state.backends.list_backends()
-        return json.dumps(backends, indent=2)
-    
-    @mcp.tool()
-    def gateway_list_tools() -> str:
-        """List all available tools across backends."""
-        tools = state.backends.list_tools()
-        return json.dumps(tools, indent=2)
-    
-    @mcp.tool()
-    def gateway_call_tool(
-        tool_name: str,
-        arguments: str = "{}",
-        backend_id: str = None,
-    ) -> str:
+    async def proxy_call(tool_name: str, arguments: str = "{}") -> str:
         """
-        Call a tool on a backend.
+        Call a tool on the proxied backend.
         
         Args:
             tool_name: Name of the tool to call
-            arguments: JSON string of arguments (default: {})
-            backend_id: Optional backend ID to route to
+            arguments: JSON string of arguments
         """
         try:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
         except json.JSONDecodeError:
             return json.dumps({"error": "Invalid JSON arguments"})
         
-        # Run async call in sync context
-        loop = asyncio.new_event_loop()
-        try:
-            success, result = loop.run_until_complete(
-                state.backends.call_tool(
-                    tool_name=tool_name,
-                    arguments=args,
-                    backend_id=backend_id,
-                )
-            )
-        finally:
-            loop.close()
+        success, result = await state.backends.call_tool(
+            tool_name=tool_name,
+            arguments=args,
+            backend_id=backend_id,
+        )
         
         if not success:
             return json.dumps({"error": result})
-        
         return json.dumps({"result": result}, indent=2)
-    
-    @mcp.tool()
-    async def gateway_connect_backend(backend_id: str) -> str:
-        """Connect to a backend service."""
-        success, error = await state.backends.connect_backend(backend_id)
-        if not success:
-            return json.dumps({"error": error})
-        return json.dumps({"connected": backend_id})
-    
+
     return mcp
+
+
+def run_mcp_proxy(backend_id: str = "github"):
+    """
+    Run the gateway as an MCP proxy to a specific backend.
+    
+    This starts an stdio MCP server that proxies all requests to the configured backend.
+    Useful for testing MCP client connections.
+    """
+    async def main():
+        config = get_config()
+        
+        logger.info(f"Starting MCP proxy for backend: {backend_id}")
+        
+        backends = BackendManager(
+            health_check_interval=config.backend.health_check_interval_seconds,
+            unhealthy_threshold=config.backend.unhealthy_threshold,
+        )
+        
+        for backend_id_def, backend_def in BACKEND_DEFINITIONS.items():
+            definition = BackendDefinition(
+                id=backend_id_def,
+                name=backend_def["name"],
+                description=backend_def["description"],
+                backend_type=BackendType.MCP_STDIO if backend_def["type"] == "mcp" else BackendType.API_REST,
+                enabled=True,
+                requires_auth=backend_def.get("requires_auth", False),
+                env_key=backend_def.get("env_key"),
+                tools=backend_def.get("tools", []),
+                command=backend_def.get("command"),
+                args=backend_def.get("args", []),
+                env={backend_def["env_key"]: os.getenv(backend_def["env_key"], "")} 
+                    if backend_def.get("env_key") else {},
+                url=backend_def.get("url"),
+                base_url=backend_def.get("base_url"),
+                auth_type=backend_def.get("auth_type"),
+            )
+            backends.register_backend(definition)
+        
+        await backends.start()
+        
+        if backend_id not in backends._backends:
+            logger.error(f"Backend {backend_id} not found. Available: {list(backends._backends.keys())}")
+            return
+        
+        logger.info(f"Connecting to backend: {backend_id}")
+        success, error = await backends.connect_backend(backend_id)
+        if not success:
+            logger.error(f"Failed to connect to {backend_id}: {error}")
+            return
+        
+        logger.info(f"Connected to {backend_id}, ready for MCP proxy")
+        
+        try:
+            from mcp.server import Server
+            from mcp.types import Tool, TextContent
+            from mcp.server.stdio import stdio_server
+            
+            server = Server(f"mcp-gateway-proxy-{backend_id}")
+            
+            @server.list_tools()
+            async def list_tools():
+                tools = backends.list_tools()
+                return [
+                    Tool(
+                        name=t["name"],
+                        description=t.get("backend_name", "MCP tool"),
+                        inputSchema=t.get("inputSchema", {}),
+                    )
+                    for t in tools
+                ]
+            
+            @server.call_tool()
+            async def call_tool(name: str, arguments: dict):
+                success, result = await backends.call_tool(
+                    tool_name=name,
+                    arguments=arguments,
+                    backend_id=backend_id,
+                )
+                if not success:
+                    return [TextContent(type="text", text=f"Error: {result}")]
+                return [TextContent(type="text", text=str(result))]
+            
+            async def run():
+                async with stdio_server(server) as (read, write):
+                    logger.info("MCP proxy running on stdio")
+                    while True:
+                        await asyncio.sleep(1)
+            
+            await run()
+        except Exception as e:
+            logger.error(f"MCP proxy error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            await backends.stop()
+
+    asyncio.run(main())
 
 
 # -----------------------------------------------------------------------------
@@ -1016,11 +1892,23 @@ def run_server():
     )
 
 
-def run_mcp_server():
-    """Run the MCP server (for stdio connection from MCP clients)."""
+def run_mcp_server(transport: str = "stdio", port: int = None):
+    """Run the MCP server.
+    
+    Args:
+        transport: Transport type - "stdio", "sse", or "streamable-http"
+        port: Port for SSE/streamable-http (defaults to 8001)
+    """
     mcp = create_mcp_server()
     if mcp:
-        mcp.run()
+        if transport == "stdio":
+            mcp.run(transport=transport)
+        else:
+            # For SSE/streamable-http, the port is set in create_mcp_server via config
+            # Just run with the mount_path
+            mcp.run(transport=transport, mount_path="/mcp")
+            # Note: FastMCP run() is blocking and manages its own server
+            # For production, consider running MCP as separate process
 
 
 if __name__ == "__main__":
@@ -1033,6 +1921,12 @@ if __name__ == "__main__":
         default="http",
         help="Server mode: http (FastAPI) or mcp (FastMCP stdio)",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="MCP transport type (only for mcp mode)",
+    )
     args = parser.parse_args()
     
     # Setup logging
@@ -1044,4 +1938,4 @@ if __name__ == "__main__":
     if args.mode == "http":
         run_server()
     else:
-        run_mcp_server()
+        run_mcp_server(transport=args.transport)

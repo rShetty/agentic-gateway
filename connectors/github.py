@@ -109,16 +109,34 @@ class BaseConnector(ABC):
     def get_tools(self) -> List[ToolDefinition]:
         """Return list of tools provided by this connector."""
         pass
-    
-    @abstractmethod
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
-        """Execute a tool call."""
-        pass
-    
+
     @abstractmethod
     async def health_check(self) -> Tuple[bool, str]:
         """Check if the service is accessible."""
         pass
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
+        """
+        Dispatch a tool call to the appropriate handler.
+
+        Looks up the tool by name in get_tools() and invokes its handler.
+        Subclasses can override for custom dispatch logic.
+        """
+        if not self._check_rate_limit():
+            return False, {"error": "Rate limit exceeded", "retry_after": 60}
+
+        # Build name→handler index once per call (tools list is small)
+        tool_map: Dict[str, ToolDefinition] = {t.name: t for t in self.get_tools()}
+        tool = tool_map.get(tool_name)
+        if tool is None:
+            return False, {"error": f"Unknown tool: {tool_name}"}
+
+        try:
+            result = await tool.handler(**arguments)
+            return True, result
+        except Exception as e:
+            logger.error(f"Tool '{tool_name}' raised: {e}")
+            return False, {"error": str(e)}
     
     async def _retry_request(
         self,
@@ -327,22 +345,7 @@ class GitHubConnector(BaseConnector):
             ),
         ]
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
-        """Execute a GitHub tool call."""
-        # Check rate limit
-        if not self._check_rate_limit():
-            return False, {"error": "Rate limit exceeded", "retry_after": 60}
-        
-        # Find the tool
-        for tool in self.get_tools():
-            if tool.name == tool_name:
-                try:
-                    result = await tool.handler(**arguments)
-                    return True, result
-                except Exception as e:
-                    return False, {"error": str(e)}
-        
-        return False, {"error": f"Unknown tool: {tool_name}"}
+    # call_tool is inherited from BaseConnector
     
     async def health_check(self) -> Tuple[bool, str]:
         """Check GitHub API accessibility."""

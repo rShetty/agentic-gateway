@@ -14,7 +14,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .github import BaseConnector, ConnectorConfig, ToolDefinition
@@ -258,42 +258,71 @@ class ConnectorRegistry:
         self,
         tool_name: str,
         arguments: Dict[str, Any],
+        user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
         Call a tool by name.
-        
+
+        Credential resolution order:
+        1. ``user_token`` — caller-supplied per-user credential (from TokenStore)
+        2. Shared credential configured on the registered connector (env var at startup)
+        3. Error: credentials required
+
         Args:
             tool_name: Name of the tool to call
             arguments: Tool arguments
-        
+            user_token: Optional per-user API token that overrides the shared credential
+
         Returns:
             Tuple of (success, result_or_error)
         """
         connector_name = self._tool_index.get(tool_name)
         if not connector_name:
             return False, {"error": f"Unknown tool: {tool_name}"}
-        
-        state = self._connectors.get(connector_name)
-        if not state:
+
+        conn_state = self._connectors.get(connector_name)
+        if not conn_state:
             return False, {"error": f"Connector not found: {connector_name}"}
-        
-        if not state.enabled:
+
+        if not conn_state.enabled:
             return False, {"error": f"Connector '{connector_name}' is disabled"}
-        
-        # Execute the tool call
+
+        # Resolve which connector instance to use
+        if user_token:
+            # Build a fresh per-request connector with the user's own credential
+            conn_class = self.CONNECTOR_TYPES.get(connector_name)
+            if conn_class is None:
+                return False, {"error": f"No class registered for connector '{connector_name}'"}
+            from connectors.github import ConnectorConfig
+            connector = conn_class(ConnectorConfig(api_key=user_token))
+            owns_connector = True
+        elif conn_state.connector.config.api_key:
+            # Use the shared connector registered at startup
+            connector = conn_state.connector
+            owns_connector = False
+        else:
+            env_key = self.CREDENTIAL_ENV_KEYS.get(connector_name, connector_name.upper() + "_API_KEY")
+            return False, {
+                "error": (
+                    f"No credentials configured for '{connector_name}'. "
+                    f"Set {env_key} as an environment variable (shared), "
+                    f"or store your personal token via POST /v1/tokens."
+                )
+            }
+
         try:
-            success, result = await state.connector.call_tool(tool_name, arguments)
-            
-            state.total_calls += 1
+            success, result = await connector.call_tool(tool_name, arguments)
+            conn_state.total_calls += 1
             if not success:
-                state.total_errors += 1
-            
+                conn_state.total_errors += 1
             return success, result
-            
         except Exception as e:
-            state.total_errors += 1
+            conn_state.total_errors += 1
             logger.error(f"Tool call failed: {tool_name}: {e}")
             return False, {"error": str(e)}
+        finally:
+            if owns_connector:
+                await connector.close()
     
     # -------------------------------------------------------------------------
     # Health Monitoring
@@ -327,7 +356,7 @@ class ConnectorRegistry:
             try:
                 healthy, message = await state.connector.health_check()
                 state.healthy = healthy
-                state.last_health_check = datetime.utcnow()
+                state.last_health_check = datetime.now(timezone.utc)
                 results[name] = (healthy, message)
                 
                 if healthy:
@@ -337,7 +366,7 @@ class ConnectorRegistry:
                     
             except Exception as e:
                 state.healthy = False
-                state.last_health_check = datetime.utcnow()
+                state.last_health_check = datetime.now(timezone.utc)
                 results[name] = (False, str(e))
                 logger.error(f"Health check failed for '{name}': {e}")
         
@@ -369,21 +398,35 @@ def get_registry() -> ConnectorRegistry:
 
 async def initialize_connectors() -> ConnectorRegistry:
     """
-    Initialize the connector registry with connectors from environment.
-    
-    This is the main entry point for setting up connectors.
+    Initialize the connector registry.
+
+    All connector types are always registered so their tools are discoverable
+    via /v1/tools even when no shared credentials are configured.  Connectors
+    without a shared credential are registered with an empty api_key; they
+    will still work as long as the calling user has stored their own token via
+    POST /v1/tokens.
     """
     registry = get_registry()
-    
-    # Register all connectors that have credentials
-    registered = registry.register_from_env()
-    
-    if registered:
-        logger.info(f"Initialized connectors: {', '.join(registered)}")
-    
-    # Start health checks
+
+    for conn_name, conn_class in registry.CONNECTOR_TYPES.items():
+        env_key = registry.CREDENTIAL_ENV_KEYS.get(conn_name)
+        shared_key = os.getenv(env_key, "") if env_key else ""
+
+        config = ConnectorConfig(api_key=shared_key)
+        connector = conn_class(config)
+        registry.register_connector(conn_name, connector, enabled=True)
+
+        if shared_key:
+            logger.info(f"Connector '{conn_name}' registered with shared credential")
+        else:
+            logger.info(
+                f"Connector '{conn_name}' registered (no shared credential — "
+                f"users must provide their own token via POST /v1/tokens)"
+            )
+
+    # Start health checks only for connectors that have a shared credential
     await registry.start_health_checks()
-    
+
     return registry
 
 

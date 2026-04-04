@@ -204,20 +204,7 @@ class LinearConnector(BaseConnector):
             ),
         ]
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
-        """Execute a Linear tool call."""
-        if not self._check_rate_limit():
-            return False, {"error": "Rate limit exceeded", "retry_after": 60}
-        
-        for tool in self.get_tools():
-            if tool.name == tool_name:
-                try:
-                    result = await tool.handler(**arguments)
-                    return True, result
-                except Exception as e:
-                    return False, {"error": str(e)}
-        
-        return False, {"error": f"Unknown tool: {tool_name}"}
+    # call_tool is inherited from BaseConnector
     
     async def health_check(self) -> Tuple[bool, str]:
         """Check Linear API accessibility."""
@@ -278,10 +265,9 @@ class LinearConnector(BaseConnector):
         if priority is not None:
             input_obj["priority"] = priority
         if status:
-            # Get status ID from name
-            status_result = await _get_status_id(team_id, status)
-            if status_result:
-                input_obj["statusId"] = status_result
+            status_id = await self._get_status_id(team_id, status)
+            if status_id:
+                input_obj["statusId"] = status_id
         if assignee_id:
             input_obj["assigneeId"] = assignee_id
         if label_ids:
@@ -705,8 +691,20 @@ class LinearConnector(BaseConnector):
         }
 
 
-async def _get_status_id(team_id: str, status_name: str) -> Optional[str]:
-    """Helper to get status ID from name."""
-    # This would need a separate query in production
-    # For now, return None and let Linear handle it
-    return None
+    async def _get_status_id(self, team_id: str, status_name: str) -> Optional[str]:
+        """Resolve a workflow state name to its ID for the given team."""
+        query = """
+            query GetWorkflowStates($teamId: String!) {
+                workflowStates(filter: { team: { id: { eq: $teamId } } }) {
+                    nodes { id name }
+                }
+            }
+        """
+        try:
+            result = await self._graphql_query(query, {"teamId": team_id})
+            for node in result.get("workflowStates", {}).get("nodes", []):
+                if node.get("name", "").lower() == status_name.lower():
+                    return node.get("id")
+        except Exception as e:
+            logger.warning(f"Failed to resolve status '{status_name}' for team {team_id}: {e}")
+        return None

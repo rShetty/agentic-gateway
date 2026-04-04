@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import secrets
-from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from pydantic import Field, field_validator
@@ -16,18 +15,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class OAuthSettings(BaseSettings):
-    """OAuth 2.1 configuration for client authentication."""
+    """OAuth 2.1 server configuration."""
 
     model_config = SettingsConfigDict(env_prefix="OAUTH_")
 
-    # JWT settings
+    # JWT signing
     jwt_secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+    code_expire_minutes: int = 10
 
-    # PKCE settings
-    pkce_code_challenge_method: str = "S256"
+    # Code verifier length
     code_verifier_length: int = 128
 
     # OAuth server endpoints
@@ -43,6 +42,55 @@ class OAuthSettings(BaseSettings):
         "vscode://*",
         "cursor://*",
     ])
+
+
+class ConnectorOAuthConfig(BaseSettings):
+    """OAuth configuration for a single connector."""
+    
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    auth_url: Optional[str] = None
+    token_url: Optional[str] = None
+    scopes: List[str] = Field(default_factory=list)
+    callback_url: str = "http://localhost:8000/oauth/callback"
+
+
+class GitHubOAuthSettings(BaseSettings):
+    """GitHub OAuth configuration."""
+    
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["repo", "read:user"])
+    callback_url: str = "http://localhost:8000/oauth/github/callback"
+
+
+class SlackOAuthSettings(BaseSettings):
+    """Slack OAuth configuration."""
+    
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["chat:write", "channels:read"])
+    callback_url: str = "http://localhost:8000/oauth/slack/callback"
+
+
+class LinearOAuthSettings(BaseSettings):
+    """Linear OAuth configuration."""
+    
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["read", "write"])
+    callback_url: str = "http://localhost:8000/oauth/linear/callback"
+
+
+class GitHubOAuthSettings(BaseSettings):
+    """GitHub OAuth configuration for third-party service auth."""
+
+    model_config = SettingsConfigDict(env_prefix="GITHUB_OAUTH_")
+
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["repo", "read:user"])
+    callback_url: str = "http://localhost:8000/oauth/github/callback"
 
 
 class SecuritySettings(BaseSettings):
@@ -105,6 +153,10 @@ class ServerSettings(BaseSettings):
     port: int = 8000
     workers: int = 1
 
+    # MCP SSE server binding (separate from main HTTP server)
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8001
+
     # TLS/SSL
     ssl_enabled: bool = False
     ssl_cert_path: Optional[str] = None
@@ -120,7 +172,7 @@ class ServerSettings(BaseSettings):
     server_version: str = "0.1.0"
     server_instructions: str = (
         "MCP Gateway - OAuth-authenticated proxy for connecting to "
-        "third-party MCP servers and APIs. Use tools to discover available "
+        "third-party MCP servers and APIs. Use tools to discover "
         "backends and route requests through this gateway."
     )
 
@@ -156,6 +208,9 @@ class GatewayConfig(BaseSettings):
 
     # Sub-configurations
     oauth: OAuthSettings = Field(default_factory=OAuthSettings)
+    github_oauth: GitHubOAuthSettings = Field(default_factory=GitHubOAuthSettings)
+    slack_oauth: SlackOAuthSettings = Field(default_factory=SlackOAuthSettings)
+    linear_oauth: LinearOAuthSettings = Field(default_factory=LinearOAuthSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     backend: BackendSettings = Field(default_factory=BackendSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
@@ -181,13 +236,30 @@ class GatewayConfig(BaseSettings):
         return self.environment == "development"
 
 
-@lru_cache()
-def get_config() -> GatewayConfig:
-    """Get cached configuration instance."""
-    return GatewayConfig()
+_config_cache: Optional[GatewayConfig] = None
+
+
+def get_config(force_reload: bool = False) -> GatewayConfig:
+    """
+    Get cached configuration instance.
+    
+    Args:
+        force_reload: If True, bypass cache and reload from environment
+    """
+    global _config_cache
+    if _config_cache is None or force_reload:
+        _config_cache = GatewayConfig(_env_file=".env")
+    return _config_cache
+
+
+def clear_config_cache() -> None:
+    """Clear the cached configuration (useful for testing)."""
+    global _config_cache
+    _config_cache = None
 
 
 # Backend definitions - these are the third-party services we proxy to
+# The 'connector' field maps to the OAuth connector for per-user token auth
 BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     # Example MCP servers
     "github": {
@@ -197,6 +269,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-github"],
         "env_key": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "connector": "github",  # Maps to OAuth connector for per-user tokens
         "tools": ["create_issue", "create_pull_request", "search_repositories", "get_file_contents"],
         "requires_auth": True,
     },
@@ -226,6 +299,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "OpenAI API direct integration",
         "base_url": "https://api.openai.com/v1",
         "env_key": "OPENAI_API_KEY",
+        "connector": "openai",
         "auth_type": "bearer",
         "tools": ["chat_completions", "embeddings", "image_generation"],
         "requires_auth": True,
@@ -236,6 +310,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Anthropic Claude API direct integration",
         "base_url": "https://api.anthropic.com/v1",
         "env_key": "ANTHROPIC_API_KEY",
+        "connector": "anthropic",
         "auth_type": "x-api-key",
         "tools": ["messages", "token_count"],
         "requires_auth": True,
@@ -246,6 +321,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Slack API direct integration",
         "base_url": "https://slack.com/api",
         "env_key": "SLACK_BOT_TOKEN",
+        "connector": "slack",
         "auth_type": "bearer",
         "tools": ["post_message", "list_channels", "get_conversation_history"],
         "requires_auth": True,
@@ -256,6 +332,7 @@ BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Linear API via GraphQL",
         "base_url": "https://api.linear.app/graphql",
         "env_key": "LINEAR_API_KEY",
+        "connector": "linear",
         "auth_type": "bearer",
         "tools": ["create_issue", "search_issues", "update_issue"],
         "requires_auth": True,

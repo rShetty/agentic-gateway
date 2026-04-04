@@ -115,20 +115,7 @@ class OpenAIConnector(BaseConnector):
             ),
         ]
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
-        """Execute an OpenAI tool call."""
-        if not self._check_rate_limit():
-            return False, {"error": "Rate limit exceeded", "retry_after": 60}
-        
-        for tool in self.get_tools():
-            if tool.name == tool_name:
-                try:
-                    result = await tool.handler(**arguments)
-                    return True, result
-                except Exception as e:
-                    return False, {"error": str(e)}
-        
-        return False, {"error": f"Unknown tool: {tool_name}"}
+    # call_tool is inherited from BaseConnector
     
     async def health_check(self) -> Tuple[bool, str]:
         """Check OpenAI API accessibility."""
@@ -367,20 +354,7 @@ class AnthropicConnector(BaseConnector):
             ),
         ]
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Any]:
-        """Execute an Anthropic tool call."""
-        if not self._check_rate_limit():
-            return False, {"error": "Rate limit exceeded", "retry_after": 60}
-        
-        for tool in self.get_tools():
-            if tool.name == tool_name:
-                try:
-                    result = await tool.handler(**arguments)
-                    return True, result
-                except Exception as e:
-                    return False, {"error": str(e)}
-        
-        return False, {"error": f"Unknown tool: {tool_name}"}
+    # call_tool is inherited from BaseConnector
     
     async def health_check(self) -> Tuple[bool, str]:
         """Check Anthropic API accessibility."""

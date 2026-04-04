@@ -41,7 +41,7 @@ class ClientRegistration(BaseModel):
     client_id: str
     client_name: str
     redirect_uris: list[str]
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_confidential: bool = True
     allowed_scopes: list[str] = Field(default_factory=lambda: ["mcp:tools", "mcp:resources"])
 
@@ -89,7 +89,7 @@ class User:
     username: str
     email: Optional[str] = None
     scopes: list[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # -----------------------------------------------------------------------------
@@ -152,7 +152,8 @@ class JWTManager:
         self.algorithm = algorithm
         self.access_token_expire_minutes = access_token_expire_minutes
         self.refresh_token_expire_days = refresh_token_expire_days
-        self._revoked_tokens: set[str] = set()  # In production, use Redis
+        # jti -> expiry timestamp; entries are cleaned up lazily on access
+        self._revoked_tokens: Dict[str, float] = {}  # In production, use Redis
 
     def create_access_token(
         self,
@@ -165,7 +166,7 @@ class JWTManager:
         if expires_delta is None:
             expires_delta = timedelta(minutes=self.access_token_expire_minutes)
         
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expire = now + expires_delta
         jti = secrets.token_urlsafe(16)
         
@@ -187,7 +188,7 @@ class JWTManager:
         scope: str,
     ) -> str:
         """Create a JWT refresh token."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expire = now + timedelta(days=self.refresh_token_expire_days)
         jti = secrets.token_urlsafe(16)
         
@@ -212,8 +213,12 @@ class JWTManager:
                 algorithms=[self.algorithm],
             )
             
-            # Check if revoked
+            # Check if revoked (also purge expired entries opportunistically)
             jti = payload.get("jti")
+            now_ts = time.time()
+            self._revoked_tokens = {
+                k: v for k, v in self._revoked_tokens.items() if v > now_ts
+            }
             if jti in self._revoked_tokens:
                 logger.warning(f"Attempted use of revoked token: {jti[:8]}...")
                 return None
@@ -230,14 +235,17 @@ class JWTManager:
             logger.debug(f"JWT decode failed: {e}")
             return None
 
-    def revoke_token(self, jti: str) -> None:
-        """Revoke a token by its ID."""
-        self._revoked_tokens.add(jti)
+    def revoke_token(self, jti: str, ttl_seconds: Optional[float] = None) -> None:
+        """Revoke a token by its ID. Stores until ttl_seconds from now (defaults to refresh token TTL)."""
+        if ttl_seconds is None:
+            ttl_seconds = self.refresh_token_expire_days * 86400
+        self._revoked_tokens[jti] = time.time() + ttl_seconds
         logger.info(f"Token revoked: {jti[:8]}...")
 
     def is_revoked(self, jti: str) -> bool:
         """Check if a token is revoked."""
-        return jti in self._revoked_tokens
+        entry = self._revoked_tokens.get(jti)
+        return entry is not None and entry > time.time()
 
 
 # -----------------------------------------------------------------------------
@@ -256,23 +264,28 @@ class OAuthProvider:
         self,
         jwt_manager: JWTManager,
         code_expire_minutes: int = 10,
+        enable_demo_user: bool = True,
+        demo_user_id: str = "demo_user_001",
+        demo_username: str = "demo",
     ):
         self.jwt = jwt_manager
         self.code_expire_minutes = code_expire_minutes
+        self._enable_demo_user = enable_demo_user
         
         # In-memory stores (replace with Redis/DB in production)
         self._clients: Dict[str, ClientRegistration] = {}
         self._auth_codes: Dict[str, AuthorizationCode] = {}
         self._users: Dict[str, User] = {}
         
-        # Demo user for POC
-        self._demo_user = User(
-            user_id="demo_user_001",
-            username="demo",
-            email="demo@mcp-gateway.local",
-            scopes=["mcp:tools", "mcp:resources"],
-        )
-        self._users[self._demo_user.user_id] = self._demo_user
+        # Demo user for POC - configurable
+        if enable_demo_user:
+            self._demo_user = User(
+                user_id=demo_user_id,
+                username=demo_username,
+                email="demo@mcp-gateway.local",
+                scopes=["mcp:tools", "mcp:resources"],
+            )
+            self._users[self._demo_user.user_id] = self._demo_user
 
     # -------------------------------------------------------------------------
     # Client Management
@@ -309,16 +322,12 @@ class OAuthProvider:
         if not client:
             return False
         
-        # Exact match or pattern match
+        # Exact match only — wildcard redirect URIs are prohibited by OAuth
+        # security best practices (RFC 6749 §3.1.2, OAuth 2.0 Security BCP).
         for registered in client.redirect_uris:
             if registered == redirect_uri:
                 return True
-            # Support wildcard patterns
-            if "*" in registered:
-                import fnmatch
-                if fnmatch.fnmatch(redirect_uri, registered):
-                    return True
-        
+
         return False
 
     # -------------------------------------------------------------------------
@@ -341,10 +350,13 @@ class OAuthProvider:
         """
         # Use demo user if no user_id provided (for POC)
         if user_id is None:
-            user_id = self._demo_user.user_id
+            if self._enable_demo_user and hasattr(self, '_demo_user'):
+                user_id = self._demo_user.user_id
+            else:
+                raise ValueError("user_id required when demo user is disabled")
         
         code = secrets.token_urlsafe(32)
-        expires_at = datetime.utcnow() + timedelta(minutes=self.code_expire_minutes)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=self.code_expire_minutes)
         
         auth_code = AuthorizationCode(
             code=code,
@@ -385,7 +397,7 @@ class OAuthProvider:
             return None
         
         # Check expiration
-        if datetime.utcnow() > auth_code.expires_at:
+        if datetime.now(timezone.utc) > auth_code.expires_at:
             logger.warning(f"Authorization code expired: {code[:12]}...")
             del self._auth_codes[code]
             return None
@@ -483,6 +495,35 @@ class OAuthProvider:
             self.jwt.revoke_token(payload.jti)
             return True
         return False
+
+    def _create_token_pair(
+        self,
+        client_id: str,
+        user_id: str,
+        scope: str,
+    ) -> TokenPair:
+        """
+        Directly issue a token pair without going through the auth code flow.
+
+        Used for the API-key creation endpoint where a full OAuth round-trip is
+        not appropriate (CLI / programmatic access).
+        """
+        access_token = self.jwt.create_access_token(
+            user_id=user_id,
+            client_id=client_id,
+            scope=scope,
+        )
+        refresh_token = self.jwt.create_refresh_token(
+            user_id=user_id,
+            client_id=client_id,
+            scope=scope,
+        )
+        return TokenPair(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=self.jwt.access_token_expire_minutes * 60,
+            scope=scope,
+        )
 
     # -------------------------------------------------------------------------
     # User Management

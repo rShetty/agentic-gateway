@@ -2,10 +2,11 @@
 
 **OAuth-authenticated MCP proxy for connecting MCP clients to third-party services.**
 
-An MCP Gateway acts as a middle layer between MCP clients (like Cursor, Claude Code, Windsurf) and third-party services. It provides:
+An MCP Gateway acts as a middle layer between MCP clients (like Cursor, Claude Code, Windsurf, OpenCode) and third-party services. It provides:
 
 - **OAuth 2.1 Authentication** with PKCE for secure client authentication
-- **Backend Aggregation** - Connect to MCP servers OR direct APIs
+- **Per-User Token Management** - Each user gets their own third-party tokens (GitHub, Slack, Linear, etc.)
+- **Backend Aggregation** - Connect to MCP servers OR direct APIs with OAuth support
 - **Security Layer** - Rate limiting, input validation, audit logging
 - **Tool Discovery** - Automatic aggregation of tools from all backends
 
@@ -175,6 +176,48 @@ These endpoints require no authentication - useful for SDK code generation:
    curl -H "Authorization: Bearer <access_token>" ...
    ```
 
+### Connecting Third-Party Services (OAuth)
+
+Users can connect their own GitHub, Slack, Linear, etc. accounts via OAuth:
+
+```bash
+# 1. Visit the web UI to connect services
+open http://localhost:8000/connectors
+
+# 2. Or use the OAuth endpoints directly
+# GitHub
+curl "http://localhost:8000/oauth/authorize/github?client_id=YOUR_CLIENT_ID&redirect_uri=http://localhost:3000/callback"
+
+# After authorization, tokens are automatically stored
+```
+
+**Supported OAuth Connectors:**
+- GitHub - Repositories, Issues, PRs, Code Search
+- Slack - Messages, Channels, Users
+- Linear - Issues, Projects, Cycles
+
+**Token Storage:**
+- Tokens stored per-user in SQLite database
+- Each user has their own tokens (isolation)
+- Fallback to "default" user for shared tokens
+
+### Token Management API
+
+```bash
+# Store a personal token for a connector
+curl -X POST http://localhost:8000/v1/tokens \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"connector_name": "github", "token": "ghp_your_token"}'
+
+# List your connected tokens
+curl http://localhost:8000/v1/tokens \
+  -H "Authorization: Bearer sk-xxx"
+
+# Response:
+# {"user_id": "api-key-my-cli", "connectors": ["github", "slack"]}
+```
+
 ### Example: Python SDK
 
 ```python
@@ -225,7 +268,7 @@ Add to your Cursor MCP settings:
 {
   "mcpServers": {
     "gateway": {
-      "url": "http://localhost:8000/mcp",
+      "url": "http://localhost:8001/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_ACCESS_TOKEN"
       }
@@ -234,28 +277,52 @@ Add to your Cursor MCP settings:
 }
 ```
 
+Note: The MCP server runs on port 8001 (streamable-http) or use stdio mode below.
+
 ### Claude Code (Claude Desktop)
 
-Add to `claude_desktop_config.json`:
+For stdio mode (recommended), add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "gateway": {
-      "command": "mcp-gateway",
-      "args": ["mcp"],
+      "command": "python",
+      "args": ["-m", "gateway.server", "mcp"],
       "env": {
-        "OAUTH_JWT_SECRET_KEY": "your-secret-key",
-        "MCP_GATEWAY_ENVIRONMENT": "production"
+        "PYTHONPATH": "/Users/rshetty/agentic-gateway"
       }
     }
   }
 }
 ```
 
+### OpenCode
+
+For stdio mode, add to your `opencode.json` or `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "bash",
+      "args": ["-c", "source venv/bin/activate && python -m gateway.server mcp"],
+      "env": {
+        "PYTHONPATH": "/Users/rshetty/agentic-gateway"
+      }
+    }
+  }
+}
+```
+
+Or use the CLI:
+```bash
+mcp-gateway mcp
+```
+
 ### Windsurf / VS Code Extensions
 
-Configure the MCP endpoint:
+Configure the MCP endpoint (streamable-http mode):
 
 ```
 Endpoint: http://localhost:8000/mcp
@@ -320,8 +387,9 @@ backends:
     args:
       - "-y"
       - "@modelcontextprotocol/server-github"
+    connector: github  # Maps to OAuth for per-user tokens
     env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PAT}
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PAT}  # Fallback token
     tools:
       - create_issue
       - create_pull_request
@@ -337,13 +405,28 @@ backends:
     type: api
     name: OpenAI
     base_url: https://api.openai.com/v1
+    connector: openai  # Enables per-user OAuth tokens
     auth_type: bearer
-    env_key: OPENAI_API_KEY
+    env_key: OPENAI_API_KEY  # Fallback token
     tools:
       - chat_completions
       - embeddings
     requires_auth: true
 ```
+
+### How Per-User Tokens Work
+
+1. **Backend Definition**: Each backend can specify a `connector` field
+2. **Token Lookup**: Gateway checks TokenStore for user's token
+3. **Fallback Chain**: 
+   - First tries: `user_id` from JWT + `connector_name`
+   - Then tries: `"default"` user + `connector_name`
+   - Finally falls back to: env var (if configured)
+4. **Token Injection**:
+   - For API backends: token goes in `Authorization: Bearer` header
+   - For MCP backends: token passed in tool arguments
+
+This means users can connect their own GitHub/Slack/Linear accounts and make API calls with their own credentials!
 
 ## API Reference
 

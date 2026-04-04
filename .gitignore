@@ -70,3 +70,5 @@ htmlcov/
 # Build
 *.egg
 .eggs/
+
+.mcp.json

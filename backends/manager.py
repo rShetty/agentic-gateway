@@ -17,7 +17,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -54,6 +54,7 @@ class BackendDefinition:
     enabled: bool = True
     requires_auth: bool = False
     env_key: Optional[str] = None
+    connector: Optional[str] = None  # Maps to OAuth connector for per-user tokens
     tools: List[str] = field(default_factory=list)
     
     # MCP-specific
@@ -99,14 +100,20 @@ class BackendState:
 class MCPBackendHandler:
     """
     Handles MCP server connections (stdio and HTTP).
-    
-    Reuses patterns from Hermes mcp_tool.py but simplified for gateway use.
+
+    Each connection runs as a long-lived background asyncio Task so that the
+    MCP SDK context managers (stdio_client / streamablehttp_client /
+    ClientSession) remain open for the lifetime of the gateway process.
+    A per-backend asyncio.Event signals readiness and a stop-Event triggers
+    graceful shutdown.
     """
 
     def __init__(self):
         self._sessions: Dict[str, Any] = {}
-        self._processes: Dict[str, subprocess.Popen] = {}
-        self._lock = asyncio.Lock()
+        # background Task per backend_id
+        self._tasks: Dict[str, asyncio.Task] = {}
+        # set() to trigger disconnect
+        self._stop_events: Dict[str, asyncio.Event] = {}
 
     async def connect_stdio(
         self,
@@ -118,46 +125,67 @@ class MCPBackendHandler:
     ) -> Tuple[bool, Optional[str]]:
         """
         Start and connect to an MCP server via stdio.
-        
+
+        Spawns a background Task that keeps the stdio_client context manager
+        open until disconnect() is called.
+
         Returns:
             (success, error_message)
         """
         try:
-            # Import MCP SDK
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
         except ImportError:
             return False, "MCP SDK not installed. Run: pip install mcp"
-        
-        # Build environment
+
+        # Build a safe, filtered environment for the subprocess
         process_env = os.environ.copy()
         process_env.update(env)
-        
-        # Filter to safe environment
         safe_keys = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR"}
-        filtered_env = {k: v for k, v in process_env.items() 
-                       if k in safe_keys or k.startswith(("MCP_", "GITHUB_", "DATABASE_"))}
+        filtered_env = {
+            k: v for k, v in process_env.items()
+            if k in safe_keys or k.startswith(("MCP_", "GITHUB_", "DATABASE_"))
+        }
         filtered_env.update(env)
-        
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=filtered_env,
-        )
-        
-        try:
-            # Connect with timeout
-            async with asyncio.timeout(timeout):
+
+        server_params = StdioServerParameters(command=command, args=args, env=filtered_env)
+
+        ready_event: asyncio.Event = asyncio.Event()
+        stop_event: asyncio.Event = asyncio.Event()
+        self._stop_events[backend_id] = stop_event
+        error_box: List[str] = []
+
+        async def _run() -> None:
+            try:
                 async with stdio_client(server_params) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         self._sessions[backend_id] = session
                         logger.info(f"Connected to MCP backend: {backend_id}")
-                        return True, None
+                        ready_event.set()
+                        # Stay connected until disconnect() signals stop
+                        await stop_event.wait()
+            except Exception as exc:
+                error_box.append(str(exc))
+                ready_event.set()  # unblock the caller even on failure
+            finally:
+                self._sessions.pop(backend_id, None)
+                logger.info(f"MCP stdio session ended: {backend_id}")
+
+        task = asyncio.create_task(_run(), name=f"mcp-stdio-{backend_id}")
+        self._tasks[backend_id] = task
+
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
+            stop_event.set()
+            task.cancel()
             return False, f"Connection timeout after {timeout}s"
-        except Exception as e:
-            return False, f"Connection failed: {e}"
+
+        if error_box:
+            return False, f"Connection failed: {error_box[0]}"
+
+        return True, None
 
     async def connect_http(
         self,
@@ -167,8 +195,10 @@ class MCPBackendHandler:
         timeout: int = 30,
     ) -> Tuple[bool, Optional[str]]:
         """
-        Connect to an MCP server via HTTP.
-        
+        Connect to an MCP server via HTTP (streamable-HTTP transport).
+
+        Runs as a background Task (same lifetime pattern as connect_stdio).
+
         Returns:
             (success, error_message)
         """
@@ -178,24 +208,50 @@ class MCPBackendHandler:
             import httpx
         except ImportError:
             return False, "MCP SDK not installed. Run: pip install mcp"
-        
+
+        stop_event: asyncio.Event = asyncio.Event()
+        self._stop_events[backend_id] = stop_event
+        ready_event: asyncio.Event = asyncio.Event()
+        error_box: List[str] = []
+
+        async def _run() -> None:
+            try:
+                client_kwargs: Dict[str, Any] = {
+                    "follow_redirects": True,
+                    "timeout": httpx.Timeout(float(timeout), read=300.0),
+                }
+                if headers:
+                    client_kwargs["headers"] = headers
+
+                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                    async with streamablehttp_client(url, http_client=http_client) as (read, write, _):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            self._sessions[backend_id] = session
+                            logger.info(f"Connected to HTTP MCP backend: {backend_id}")
+                            ready_event.set()
+                            await stop_event.wait()
+            except Exception as exc:
+                error_box.append(str(exc))
+                ready_event.set()
+            finally:
+                self._sessions.pop(backend_id, None)
+                logger.info(f"MCP HTTP session ended: {backend_id}")
+
+        task = asyncio.create_task(_run(), name=f"mcp-http-{backend_id}")
+        self._tasks[backend_id] = task
+
         try:
-            client_kwargs = {
-                "follow_redirects": True,
-                "timeout": httpx.Timeout(float(timeout), read=300.0),
-            }
-            if headers:
-                client_kwargs["headers"] = headers
-            
-            async with httpx.AsyncClient(**client_kwargs) as http_client:
-                async with streamablehttp_client(url, http_client=http_client) as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        self._sessions[backend_id] = session
-                        logger.info(f"Connected to HTTP MCP backend: {backend_id}")
-                        return True, None
-        except Exception as e:
-            return False, f"HTTP connection failed: {e}"
+            await asyncio.wait_for(ready_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            stop_event.set()
+            task.cancel()
+            return False, f"Connection timeout after {timeout}s"
+
+        if error_box:
+            return False, f"HTTP connection failed: {error_box[0]}"
+
+        return True, None
 
     async def call_tool(
         self,
@@ -203,36 +259,51 @@ class MCPBackendHandler:
         tool_name: str,
         arguments: Dict[str, Any],
         timeout: int = 120,
+        user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
         Call a tool on an MCP backend.
-        
+
+        Args:
+            backend_id: The backend ID
+            tool_name: Name of the tool to call
+            arguments: Tool arguments
+            timeout: Timeout in seconds
+            user_token: Optional per-user token (injected into env for subprocess)
+
         Returns:
             (success, result_or_error)
         """
         session = self._sessions.get(backend_id)
         if not session:
             return False, f"Backend {backend_id} not connected"
-        
+
+        # For MCP stdio, we need to pass the token via environment
+        # Since we can't easily modify the running subprocess env,
+        # we use a workaround: pass token via tool arguments if supported
+        # Or restart the session with new token (heavier but works)
+        if user_token:
+            # Try to inject token - some MCP servers accept it via env
+            # The MCP server process already has env set at startup
+            # For per-user tokens, we'd need per-user sessions
+            # For now, we'll pass it as part of the call
+            arguments = {**arguments, "_user_token": user_token}
+
         try:
             async with asyncio.timeout(timeout):
                 result = await session.call_tool(tool_name, arguments=arguments)
-                
+
                 if result.isError:
-                    error_text = ""
-                    for block in (result.content or []):
-                        if hasattr(block, "text"):
-                            error_text += block.text
+                    error_text = "".join(
+                        block.text for block in (result.content or []) if hasattr(block, "text")
+                    )
                     return False, error_text or "MCP tool error"
-                
-                # Extract content
-                parts = []
-                for block in (result.content or []):
-                    if hasattr(block, "text"):
-                        parts.append(block.text)
-                
+
+                parts = [
+                    block.text for block in (result.content or []) if hasattr(block, "text")
+                ]
                 return True, "\n".join(parts) if parts else ""
-                
+
         except asyncio.TimeoutError:
             return False, f"Tool call timeout after {timeout}s"
         except Exception as e:
@@ -243,27 +314,36 @@ class MCPBackendHandler:
         session = self._sessions.get(backend_id)
         if not session:
             return False, []
-        
+
         try:
             result = await session.list_tools()
-            tools = []
-            for tool in (result.tools if hasattr(result, "tools") else []):
-                tools.append({
+            tools = [
+                {
                     "name": tool.name,
                     "description": getattr(tool, "description", ""),
                     "inputSchema": getattr(tool, "inputSchema", {}),
-                })
+                }
+                for tool in (result.tools if hasattr(result, "tools") else [])
+            ]
             return True, tools
         except Exception as e:
             logger.error(f"Failed to list tools for {backend_id}: {e}")
             return False, []
 
     async def disconnect(self, backend_id: str) -> None:
-        """Disconnect from an MCP backend."""
-        if backend_id in self._sessions:
-            # Session cleanup happens via context manager
-            del self._sessions[backend_id]
-            logger.info(f"Disconnected from MCP backend: {backend_id}")
+        """Gracefully shut down the background session task for a backend."""
+        stop_event = self._stop_events.pop(backend_id, None)
+        if stop_event:
+            stop_event.set()
+        task = self._tasks.pop(backend_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._sessions.pop(backend_id, None)
+        logger.info(f"Disconnected from MCP backend: {backend_id}")
 
 
 # -----------------------------------------------------------------------------
@@ -327,7 +407,7 @@ class APIBackendHandler:
                 # Try JSON, fall back to text
                 try:
                     return True, response.json()
-                except:
+                except Exception:
                     return True, {"text": response.text}
                     
         except asyncio.TimeoutError:
@@ -516,7 +596,7 @@ class BackendManager:
         
         if success:
             state.status = BackendStatus.HEALTHY
-            state.last_healthy = datetime.utcnow()
+            state.last_healthy = datetime.now(timezone.utc)
             state.consecutive_failures = 0
             logger.info(f"Connected to backend: {backend_id} ({latency_ms:.0f}ms)")
         else:
@@ -563,7 +643,7 @@ class BackendManager:
     def list_tools(self) -> List[Dict[str, Any]]:
         """List all available tools across backends."""
         tools = []
-        for backend_id, tool_name in self._tool_index.items():
+        for tool_name, backend_id in self._tool_index.items():
             state = self._backends.get(backend_id)
             if state and state.status == BackendStatus.HEALTHY:
                 tools.append({
@@ -579,10 +659,18 @@ class BackendManager:
         arguments: Dict[str, Any],
         backend_id: Optional[str] = None,
         timeout: int = 120,
+        user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
         Call a tool, routing to the appropriate backend.
         
+        Args:
+            tool_name: Name of the tool to call
+            arguments: Tool arguments
+            backend_id: Optional backend ID (auto-resolved if not provided)
+            timeout: Timeout in seconds
+            user_token: Optional per-user token for OAuth-authenticated backends
+            
         Returns:
             (success, result_or_error)
         """
@@ -610,6 +698,7 @@ class BackendManager:
                     tool_name=tool_name,
                     arguments=arguments,
                     timeout=timeout,
+                    user_token=user_token,
                 )
             elif definition.backend_type == BackendType.MCP_HTTP:
                 success, result = await self._mcp_handler.call_tool(
@@ -617,11 +706,12 @@ class BackendManager:
                     tool_name=tool_name,
                     arguments=arguments,
                     timeout=timeout,
+                    user_token=user_token,
                 )
             else:
                 # API backend - this would need more sophisticated routing
                 success, result = await self._call_api_tool(
-                    definition, tool_name, arguments, timeout
+                    definition, tool_name, arguments, timeout, user_token
                 )
             
             # Update metrics
@@ -636,7 +726,7 @@ class BackendManager:
                     state.status = BackendStatus.UNHEALTHY
             else:
                 state.consecutive_failures = 0
-                state.last_healthy = datetime.utcnow()
+                state.last_healthy = datetime.now(timezone.utc)
             
             return success, result
             
@@ -652,17 +742,28 @@ class BackendManager:
         tool_name: str,
         arguments: Dict[str, Any],
         timeout: int,
+        user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
         Call a tool on an API backend.
         
+        Args:
+            definition: Backend definition
+            tool_name: Name of the tool to call
+            arguments: Tool arguments
+            timeout: Timeout in seconds
+            user_token: Optional per-user token (takes priority over env var)
+            
         This is a simplified implementation - production would need
         tool-specific handlers for each API.
         """
         # Build headers from auth config
         headers = dict(definition.headers)
-        if definition.env_key:
-            cred = os.getenv(definition.env_key, "")
+        
+        # Use per-user token if provided, otherwise fall back to env var
+        cred = user_token if user_token else os.getenv(definition.env_key, "")
+        
+        if cred:
             if definition.auth_type == "bearer":
                 headers["Authorization"] = f"Bearer {cred}"
             elif definition.auth_type == "x-api-key":
@@ -702,7 +803,7 @@ class BackendManager:
                 success, tools = await self._mcp_handler.list_tools(backend_id)
                 if success:
                     state.status = BackendStatus.HEALTHY
-                    state.last_healthy = datetime.utcnow()
+                    state.last_healthy = datetime.now(timezone.utc)
                     state.consecutive_failures = 0
                 else:
                     state.consecutive_failures += 1
@@ -723,5 +824,5 @@ class BackendManager:
                     if success:
                         state.status = BackendStatus.HEALTHY
                         state.consecutive_failures = 0
-                except:
+                except Exception:
                     state.consecutive_failures += 1

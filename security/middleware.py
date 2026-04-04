@@ -12,14 +12,16 @@ Implements:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 
@@ -61,7 +63,7 @@ class RateLimiter:
         # Client ID -> RateLimitEntry
         self._clients: Dict[str, RateLimitEntry] = defaultdict(RateLimitEntry)
         self._request_count = 0
-        self._lock = None  # Will be set in async context
+        self._lock = threading.Lock()
 
     def _cleanup_if_needed(self) -> None:
         """Remove old entries periodically to prevent memory leak."""
@@ -91,60 +93,62 @@ class RateLimiter:
             - retry_after: seconds until unblocked (if blocked)
         """
         now = time.time()
-        entry = self._clients[client_id]
         
-        # Check if currently blocked
-        if entry.blocked_until > now:
-            return False, {
-                "blocked": True,
-                "retry_after": int(entry.blocked_until - now),
-                "reason": "rate_limit_exceeded",
+        with self._lock:
+            entry = self._clients[client_id]
+            
+            # Check if currently blocked
+            if entry.blocked_until > now:
+                return False, {
+                    "blocked": True,
+                    "retry_after": int(entry.blocked_until - now),
+                    "reason": "rate_limit_exceeded",
+                }
+            
+            # Clean old timestamps
+            minute_ago = now - 60
+            hour_ago = now - 3600
+            entry.timestamps = [ts for ts in entry.timestamps if ts > hour_ago]
+            
+            # Count requests in windows
+            minute_count = sum(1 for ts in entry.timestamps if ts > minute_ago)
+            hour_count = len(entry.timestamps)
+            
+            # Check limits
+            if minute_count >= self.requests_per_minute:
+                # Block for remainder of minute
+                entry.blocked_until = now + 60
+                logger.warning(
+                    f"Rate limit exceeded for client {client_id[:12]}... "
+                    f"({minute_count}/{self.requests_per_minute} per minute)"
+                )
+                return False, {
+                    "blocked": True,
+                    "retry_after": 60,
+                    "reason": "minute_limit_exceeded",
+                }
+            
+            if hour_count >= self.requests_per_hour:
+                # Block for remainder of hour
+                entry.blocked_until = now + 3600
+                logger.warning(
+                    f"Rate limit exceeded for client {client_id[:12]}... "
+                    f"({hour_count}/{self.requests_per_hour} per hour)"
+                )
+                return False, {
+                    "blocked": True,
+                    "retry_after": 3600,
+                    "reason": "hour_limit_exceeded",
+                }
+            
+            # Record this request
+            entry.timestamps.append(now)
+            self._cleanup_if_needed()
+            
+            return True, {
+                "remaining_minute": self.requests_per_minute - minute_count - 1,
+                "remaining_hour": self.requests_per_hour - hour_count - 1,
             }
-        
-        # Clean old timestamps
-        minute_ago = now - 60
-        hour_ago = now - 3600
-        entry.timestamps = [ts for ts in entry.timestamps if ts > hour_ago]
-        
-        # Count requests in windows
-        minute_count = sum(1 for ts in entry.timestamps if ts > minute_ago)
-        hour_count = len(entry.timestamps)
-        
-        # Check limits
-        if minute_count >= self.requests_per_minute:
-            # Block for remainder of minute
-            entry.blocked_until = now + 60
-            logger.warning(
-                f"Rate limit exceeded for client {client_id[:12]}... "
-                f"({minute_count}/{self.requests_per_minute} per minute)"
-            )
-            return False, {
-                "blocked": True,
-                "retry_after": 60,
-                "reason": "minute_limit_exceeded",
-            }
-        
-        if hour_count >= self.requests_per_hour:
-            # Block for remainder of hour
-            entry.blocked_until = now + 3600
-            logger.warning(
-                f"Rate limit exceeded for client {client_id[:12]}... "
-                f"({hour_count}/{self.requests_per_hour} per hour)"
-            )
-            return False, {
-                "blocked": True,
-                "retry_after": 3600,
-                "reason": "hour_limit_exceeded",
-            }
-        
-        # Record this request
-        entry.timestamps.append(now)
-        self._cleanup_if_needed()
-        
-        return True, {
-            "remaining_minute": self.requests_per_minute - minute_count - 1,
-            "remaining_hour": self.requests_per_hour - hour_count - 1,
-        }
 
 
 # -----------------------------------------------------------------------------
@@ -156,24 +160,22 @@ class InputValidator:
     Validates and sanitizes input to prevent injection attacks.
     """
 
-    # Patterns that suggest injection attempts
+    # Inline (?i) flags inside a joined alternation are rejected by Python 3.14+.
+    # Case-insensitivity is handled by passing re.IGNORECASE to re.compile below.
     DANGEROUS_PATTERNS = [
-        # SQL injection
-        r"(?i)(\b(union|select|insert|update|delete|drop|create|alter)\b.*\b(from|into|table|database)\b)",
-        r"(?i)(--\s*$|;\s*$)",
-        # Command injection
-        r"[;&|`$](\s*\w+)+",
-        r"\$\([^)]+\)",  # $(command)
-        r"`[^`]+`",  # `command`
-        # Path traversal
+        r"\bunion\s+select\b",
+        r"\bselect\s+.*\s+from\b",
+        r"\bdrop\s+table\b",
+        r"--\s*$",
+        r"[;&|`$]\s*\w+",
+        r"\$\([^)]+\)",
+        r"`[^`]+`",
         r"\.\./|\.\.\\",
-        # Script injection
-        r"<script[^>]*>.*?</script>",
+        r"<script",
         r"javascript:",
         r"on\w+\s*=",
     ]
 
-    # Sensitive field patterns
     SENSITIVE_PATTERNS = [
         r"password",
         r"secret",
@@ -182,6 +184,8 @@ class InputValidator:
         r"credential",
         r"private[_-]?key",
     ]
+
+    MAX_PATTERN_LENGTH = 1000
 
     def __init__(
         self,
@@ -211,30 +215,37 @@ class InputValidator:
         if len(value) > self.max_string_length:
             return False, f"{field_name} exceeds maximum length ({self.max_string_length})"
         
-        # Check for dangerous patterns
-        if self._dangerous_re.search(value):
-            logger.warning(f"Potential injection detected in {field_name}")
-            return False, f"{field_name} contains potentially dangerous content"
+        if len(value) > self.MAX_PATTERN_LENGTH:
+            logger.warning(f"Input too long for pattern matching in {field_name}")
+            return False, f"{field_name} too long for security validation"
+        
+        try:
+            if self._dangerous_re.search(value):
+                logger.warning(f"Potential injection detected in {field_name}")
+                return False, f"{field_name} contains potentially dangerous content"
+        except re.error:
+            logger.error(f"Regex error in validate_string")
+            return False, f"{field_name} contains invalid characters"
         
         return True, value
 
-    def sanitize(self, value: Any, depth: int = 0) -> Any:
+    def redact_for_audit(self, value: Any, depth: int = 0) -> Any:
         """
-        Recursively sanitize a value (dict, list, or primitive).
+        Prepare a value for safe inclusion in audit logs.
 
-        - Redacts sensitive fields
-        - Escapes HTML if enabled
-        - Truncates long strings
+        - Redacts sensitive field names (passwords, tokens, keys, …)
+        - Truncates excessively long strings
+        - HTML-escapes strings when sanitize_html is True (log display only)
+
+        NOTE: this must NOT be applied to values that will be forwarded to
+        backend APIs — HTML-escaping would corrupt payloads.
         """
-        if depth > 10:  # Prevent deep recursion
+        if depth > 10:
             return "[truncated - max depth]"
-        
+
         if isinstance(value, str):
-            # Truncate if too long
             if len(value) > self.max_string_length:
-                value = value[:self.max_string_length] + "...[truncated]"
-            
-            # HTML escape if enabled
+                value = value[: self.max_string_length] + "...[truncated]"
             if self.sanitize_html:
                 value = (
                     value.replace("&", "&amp;")
@@ -243,49 +254,54 @@ class InputValidator:
                     .replace('"', "&quot;")
                     .replace("'", "&#x27;")
                 )
-            
             return value
-        
-        elif isinstance(value, dict):
+
+        if isinstance(value, dict):
             result = {}
             for k, v in value.items():
-                # Redact sensitive fields
                 if self._sensitive_re.search(str(k)):
                     result[k] = "[REDACTED]"
                 else:
-                    result[k] = self.sanitize(v, depth + 1)
+                    result[k] = self.redact_for_audit(v, depth + 1)
             return result
-        
-        elif isinstance(value, list):
-            return [self.sanitize(item, depth + 1) for item in value]
-        
-        else:
-            return value
+
+        if isinstance(value, list):
+            return [self.redact_for_audit(item, depth + 1) for item in value]
+
+        return value
+
+    # Keep `sanitize` as an alias for backwards-compat, but redirect callers
+    # to redact_for_audit explicitly at call sites.
+    sanitize = redact_for_audit
 
     def validate_tool_arguments(
-        self, 
-        tool_name: str, 
-        arguments: Dict[str, Any]
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
     ) -> tuple[bool, Dict[str, Any]]:
         """
         Validate tool call arguments.
 
+        Returns validated arguments unchanged (no HTML encoding) so they can
+        be forwarded as-is to backend APIs.
+
         Returns:
-            (is_valid, sanitized_args_or_error_dict)
+            (is_valid, validated_args_or_error_dict)
         """
-        sanitized = {}
+        validated: Dict[str, Any] = {}
         for key, value in arguments.items():
             if isinstance(value, str):
                 is_valid, result = self.validate_string(value, key)
                 if not is_valid:
                     return False, {"error": result, "field": key}
-                sanitized[key] = result
+                validated[key] = result
             elif isinstance(value, (dict, list)):
-                sanitized[key] = self.sanitize(value)
+                # Nested structures: only check length/depth, no HTML escaping
+                validated[key] = value
             else:
-                sanitized[key] = value
-        
-        return True, sanitized
+                validated[key] = value
+
+        return True, validated
 
 
 # -----------------------------------------------------------------------------
@@ -358,7 +374,7 @@ class AuditLogger:
             return
         
         event = AuditEvent(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             event_type=event_type,
             client_id=client_id,
             user_id=user_id,
@@ -427,8 +443,6 @@ class IPRestrictions:
         self._whitelist_networks = []
         self._blacklist_networks = []
         
-        # Parse CIDR networks
-        import ipaddress
         for ip in self.whitelist:
             if "/" in ip:
                 self._whitelist_networks.append(ipaddress.ip_network(ip, strict=False))
@@ -444,22 +458,25 @@ class IPRestrictions:
             (is_allowed, reason)
         """
         if not ip or ip == "unknown":
+            # Unknown IP: allow only when no whitelist is active; when a
+            # whitelist is configured we cannot verify membership, so deny.
+            if self.whitelist:
+                logger.warning("Request with unknown IP rejected: whitelist is active")
+                return False, "unknown_ip_whitelist_active"
             return True, "unknown_ip"
-        
-        import ipaddress
-        
+
         try:
             ip_obj = ipaddress.ip_address(ip)
         except ValueError:
             return False, "invalid_ip"
-        
+
         # Check blacklist first
         if ip in self.blacklist:
             return False, "blacklisted"
         for network in self._blacklist_networks:
             if ip_obj in network:
                 return False, "blacklisted_range"
-        
+
         # If whitelist is non-empty, IP must be in it
         if self.whitelist:
             if ip in self.whitelist:
@@ -468,7 +485,7 @@ class IPRestrictions:
                 if ip_obj in network:
                     return True, "whitelisted_range"
             return False, "not_in_whitelist"
-        
+
         return True, "allowed"
 
 

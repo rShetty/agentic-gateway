@@ -119,6 +119,102 @@ mcp-gateway call \
   --token YOUR_ACCESS_TOKEN
 ```
 
+## REST API (Non-MCP Clients)
+
+The gateway provides a complete REST API for CLIs, SDKs, and applications that don't use MCP.
+
+### Quick Start (API Key)
+
+```bash
+# 1. Create an API key
+curl -X POST http://localhost:8000/v1/api-keys \
+  -H "Content-Type: application/json" \
+  -d '{"client_name": "My CLI", "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"]}'
+
+# Response:
+# {"api_key": "sk-abc123...", "client_id": "client_xyz", ...}
+
+# 2. Discover available tools (no auth required)
+curl http://localhost:8000/v1/tools
+
+# 3. Call a tool
+curl -X POST http://localhost:8000/v1/call \
+  -H "Authorization: Bearer sk-abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{"tool_name": "github_search_repositories", "arguments": {"query": "mcp"}}'
+```
+
+### Public Discovery Endpoints
+
+These endpoints require no authentication - useful for SDK code generation:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/tools` | List all tools in OpenAI-compatible format |
+| `GET /v1/tools/{name}` | Get JSON schema for a specific tool |
+| `GET /v1/connectors` | List all third-party connectors |
+
+### Authenticated Tool Execution
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/call` | Execute a single tool |
+| `POST /v1/batch` | Execute up to 10 tools in one request |
+
+### Authentication Options
+
+1. **API Key** (Simplest for CLIs):
+   ```bash
+   curl -H "Authorization: Bearer sk-xxx" ...
+   # or
+   curl -H "ApiKey: sk-xxx" ...
+   ```
+
+2. **OAuth Bearer Token**:
+   ```bash
+   curl -H "Authorization: Bearer <access_token>" ...
+   ```
+
+### Example: Python SDK
+
+```python
+import httpx
+
+class MCPGatewayClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url
+        self.headers = {"Authorization": f"Bearer {api_key}"}
+    
+    def list_tools(self):
+        resp = httpx.get(f"{self.base_url}/v1/tools")
+        return resp.json()["data"]
+    
+    def call(self, tool_name: str, arguments: dict):
+        resp = httpx.post(
+            f"{self.base_url}/v1/call",
+            headers=self.headers,
+            json={"tool_name": tool_name, "arguments": arguments}
+        )
+        return resp.json()
+
+# Usage
+client = MCPGatewayClient("http://localhost:8000", "sk-xxx")
+tools = client.list_tools()
+result = client.call("github_search_repositories", {"query": "mcp"})
+```
+
+### Example: Batch Execution
+
+```bash
+curl -X POST http://localhost:8000/v1/batch \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {"tool_name": "github_search_repositories", "arguments": {"query": "mcp"}},
+    {"tool_name": "slack_post_message", "arguments": {"channel": "C123", "text": "Hello"}}
+  ]'
+```
+
 ## Connecting MCP Clients
 
 ### Cursor

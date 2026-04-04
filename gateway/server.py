@@ -276,7 +276,7 @@ class TokenRequest(BaseModel):
     refresh_token: Optional[str] = None
 
 
-@app.post("/oauth/register")
+@app.post("/oauth/register", tags=["OAuth"])
 async def register_client(req: ClientRegistrationRequest):
     """Register a new OAuth client."""
     client = state.oauth.register_client(
@@ -291,7 +291,7 @@ async def register_client(req: ClientRegistrationRequest):
     }
 
 
-@app.get("/oauth/authorize")
+@app.get("/oauth/authorize", tags=["OAuth"])
 async def authorize_page(
     client_id: str,
     redirect_uri: str,
@@ -351,7 +351,7 @@ async def authorize_page(
     }
 
 
-@app.post("/oauth/token")
+@app.post("/oauth/token", tags=["OAuth"])
 async def token_endpoint(req: TokenRequest):
     """OAuth token endpoint - exchange code for tokens."""
     if req.grant_type == "authorization_code":
@@ -400,7 +400,7 @@ async def token_endpoint(req: TokenRequest):
         raise HTTPException(status_code=400, detail="Unsupported grant_type")
 
 
-@app.post("/oauth/revoke")
+@app.post("/oauth/revoke", tags=["OAuth"])
 async def revoke_token(request: Request):
     """Revoke an access or refresh token."""
     body = await request.json()
@@ -417,7 +417,7 @@ async def revoke_token(request: Request):
 # MCP Gateway Endpoints
 # -----------------------------------------------------------------------------
 
-@app.get("/")
+@app.get("/", tags=["Info"])
 async def root():
     """Gateway info endpoint."""
     return {
@@ -432,17 +432,33 @@ async def root():
                 "token": "/oauth/token",
                 "revoke": "/oauth/revoke",
             },
-            "mcp": {
-                "tools": "/mcp/tools",
-                "call": "/mcp/call",
-                "backends": "/mcp/backends",
+            "api_keys": {
+                "create": "/v1/api-keys",
+                "usage": "Authorization: Bearer <api_key> or ApiKey: <api_key>",
+            },
+            "v1_rest_api": {
+                "tools": "/v1/tools (public discovery)",
+                "tool_schema": "/v1/tools/{tool_name} (public)",
+                "call": "/v1/call (requires auth)",
+                "batch": "/v1/batch (requires auth)",
+                "connectors": "/v1/connectors (public discovery)",
+            },
+            "mcp_compatible": {
+                "tools": "/mcp/tools (requires auth)",
+                "call": "/mcp/call (requires auth)",
+                "backends": "/mcp/backends (requires auth)",
+                "connectors": "/mcp/connectors (requires auth)",
             },
             "health": "/health",
+        },
+        "documentation": {
+            "openapi": "/docs",
+            "redoc": "/redoc",
         },
     }
 
 
-@app.get("/health")
+@app.get("/health", tags=["Info"])
 async def health():
     """Health check endpoint."""
     backends_healthy = sum(
@@ -461,13 +477,13 @@ async def health():
     }
 
 
-@app.get("/mcp/backends")
+@app.get("/mcp/backends", tags=["MCP Compatible"])
 async def list_backends(user: Dict = Depends(get_current_user)):
     """List all available backends and their status."""
     return state.backends.list_backends()
 
 
-@app.post("/mcp/backends/{backend_id}/connect")
+@app.post("/mcp/backends/{backend_id}/connect", tags=["MCP Compatible"])
 async def connect_backend(
     backend_id: str, 
     user: Dict = Depends(get_current_user),
@@ -491,9 +507,9 @@ async def connect_backend(
     return {"connected": True, "backend_id": backend_id}
 
 
-@app.get("/mcp/tools")
+@app.get("/mcp/tools", tags=["MCP Compatible"])
 async def list_tools(user: Dict = Depends(get_current_user)):
-    """List all available tools across backends and connectors."""
+    """List all available tools across backends and connectors (authenticated)."""
     backend_tools = state.backends.list_tools()
     connector_tools = state.connectors.get_all_tools()
     
@@ -504,13 +520,313 @@ async def list_tools(user: Dict = Depends(get_current_user)):
     }
 
 
-@app.get("/mcp/connectors")
+# -----------------------------------------------------------------------------
+# Public Discovery Endpoints (No Auth Required)
+# -----------------------------------------------------------------------------
+
+@app.get("/v1/tools", tags=["Discovery"])
+async def discover_tools():
+    """
+    Public tool discovery endpoint - no authentication required.
+    
+    Returns tools in OpenAI-compatible format for easy SDK integration.
+    Used by CLIs and SDKs to discover available tools before authentication.
+    """
+    backend_tools = state.backends.list_tools()
+    connector_tools = state.connectors.get_all_tools()
+    
+    # Format in OpenAI-compatible tool format
+    all_tools = []
+    
+    for tool in backend_tools + connector_tools:
+        all_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+            },
+            "x-connector": tool.get("connector"),
+            "x-requires-auth": tool.get("requires_auth", False),
+        })
+    
+    return {
+        "object": "list",
+        "data": all_tools,
+        "total": len(all_tools),
+    }
+
+
+@app.get("/v1/tools/{tool_name}", tags=["Discovery"])
+async def get_tool_schema(tool_name: str):
+    """
+    Get JSON schema for a specific tool - no authentication required.
+    
+    Returns MCP-compatible tool schema for SDK code generation.
+    """
+    # Check connectors first
+    connector_schema = state.connectors.get_tool_schema(tool_name)
+    if connector_schema:
+        return {
+            "name": tool_name,
+            "schema": connector_schema,
+        }
+    
+    # Check backends
+    for tool in state.backends.list_tools():
+        if tool.get("name") == tool_name:
+            return {
+                "name": tool_name,
+                "schema": {
+                    "name": tool_name,
+                    "description": tool.get("description", ""),
+                    "inputSchema": {
+                        "type": "object",
+                        **tool.get("parameters", {}),
+                    },
+                },
+            }
+    
+    raise HTTPException(status_code=404, detail=f"Tool not found: {tool_name}")
+
+
+@app.get("/v1/connectors", tags=["Discovery"])
+async def discover_connectors():
+    """
+    Public connector discovery endpoint - no authentication required.
+    
+    Lists all available third-party connectors and their status.
+    """
+    return {
+        "connectors": [
+            {
+                "name": c.get("name"),
+                "display_name": c.get("display_name"),
+                "description": c.get("description"),
+                "tools_count": len(c.get("tools", [])),
+                "healthy": c.get("healthy"),
+            }
+            for c in state.connectors.list_connectors()
+        ]
+    }
+
+
+# -----------------------------------------------------------------------------
+# API Key Authentication (Alternative to OAuth)
+# -----------------------------------------------------------------------------
+
+async def get_current_user_api_key(
+    request: Request,
+    authorization: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    FastAPI dependency for API key authentication (simpler than OAuth).
+    
+    Supports:
+    - Bearer token (OAuth access token)
+    - ApiKey header (simple API key)
+    
+    For API keys, the key IS the access token (created via OAuth register).
+    """
+    if not authorization:
+        authorization = request.headers.get("Authorization") or request.headers.get("ApiKey")
+    
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization or ApiKey header")
+    
+    # Handle ApiKey header
+    if authorization.startswith("sk-"):
+        token = authorization
+    # Handle Bearer token
+    elif authorization.startswith("Bearer "):
+        token = authorization[7:]  # Remove "Bearer " prefix
+    else:
+        # Treat as raw API key
+        token = authorization
+    
+    # Validate token
+    user_info = state.oauth.validate_access_token(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    return user_info
+
+
+@app.post("/v1/api-keys", tags=["API Keys"])
+async def create_api_key(
+    req: ClientRegistrationRequest,
+):
+    """
+    Create a simple API key for programmatic access.
+    
+    This is a simplified flow for CLIs and SDKs that don't want OAuth:
+    1. Register with a name and callback URL
+    2. Get an API key (sk-...) immediately
+    3. Use the API key in Authorization: Bearer sk-... or ApiKey: sk-...
+    """
+    # Register as OAuth client
+    client = state.oauth.register_client(
+        client_name=req.client_name,
+        redirect_uris=req.redirect_uris or ["urn:ietf:wg:oauth:2.0:oob"],
+        is_confidential=False,  # Public client for API key flow
+    )
+    
+    # Create an access token directly (bypass OAuth flow)
+    # The API key IS the access token
+    token_pair = state.oauth._create_token_pair(
+        client_id=client.client_id,
+        user_id=f"api-key-{client.client_name}",
+        scope="mcp:tools",
+    )
+    
+    return {
+        "api_key": token_pair.access_token,
+        "client_id": client.client_id,
+        "client_name": client.client_name,
+        "expires_in": token_pair.expires_in,
+        "usage": {
+            "header": "Authorization: Bearer <api_key>",
+            "alt_header": "ApiKey: <api_key>",
+        },
+    }
+
+
+# -----------------------------------------------------------------------------
+# v1 REST API Endpoints (OpenAI-Compatible)
+# -----------------------------------------------------------------------------
+
+class V1ToolCallRequest(BaseModel):
+    """OpenAI-compatible tool call request."""
+    tool_name: str
+    arguments: Dict[str, Any] = {}
+    timeout: int = 120
+
+
+@app.post("/v1/call", tags=["Tool Execution"])
+async def v1_call_tool(
+    req: V1ToolCallRequest,
+    user: Dict = Depends(get_current_user_api_key),
+    ip: str = Depends(get_client_ip),
+):
+    """
+    Execute a tool call - OpenAI-compatible endpoint.
+    
+    Supports both OAuth Bearer tokens and simple API keys.
+    
+    Example:
+        curl -X POST https://gateway/v1/call \\
+          -H "Authorization: Bearer sk-xxx" \\
+          -H "Content-Type: application/json" \\
+          -d '{"tool_name": "github_search_repositories", "arguments": {"query": "mcp"}}'
+    """
+    # Security check
+    allowed, info = state.security.check_request(
+        client_id=user["client_id"],
+        ip_address=ip,
+        user_id=user["user_id"],
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, detail=info)
+    
+    # Validate and sanitize arguments
+    valid, sanitized = state.security.validate_and_sanitize(
+        tool_name=req.tool_name,
+        arguments=req.arguments,
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail=sanitized)
+    
+    # First try connector tools
+    connector_name = state.connectors._tool_index.get(req.tool_name)
+    if connector_name:
+        success, result = await state.connectors.call_tool(
+            tool_name=req.tool_name,
+            arguments=sanitized,
+        )
+    else:
+        # Fall back to backend tools
+        success, result = await state.backends.call_tool(
+            tool_name=req.tool_name,
+            arguments=sanitized,
+            timeout=req.timeout,
+        )
+    
+    # Audit log
+    state.security.log_tool_call(
+        client_id=user["client_id"],
+        user_id=user["user_id"],
+        ip_address=ip,
+        tool_name=req.tool_name,
+        arguments=req.arguments,
+        success=success,
+        result_summary=str(result)[:200] if result else None,
+    )
+    
+    if not success:
+        return JSONResponse(
+            status_code=400,
+            content={"error": result},
+        )
+    
+    return {
+        "object": "tool.call",
+        "tool_name": req.tool_name,
+        "success": True,
+        "result": result,
+    }
+
+
+@app.post("/v1/batch", tags=["Tool Execution"])
+async def v1_batch_call(
+    requests: List[V1ToolCallRequest],
+    user: Dict = Depends(get_current_user_api_key),
+    ip: str = Depends(get_client_ip),
+):
+    """
+    Execute multiple tool calls in a single request.
+    
+    Maximum 10 tools per batch. Returns results in order.
+    """
+    if len(requests) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 tools per batch")
+    
+    results = []
+    for req in requests:
+        try:
+            # Reuse single tool call logic
+            result = await v1_call_tool(req, user, ip)
+            results.append({
+                "tool_name": req.tool_name,
+                "success": True,
+                "result": result.get("result"),
+            })
+        except HTTPException as e:
+            results.append({
+                "tool_name": req.tool_name,
+                "success": False,
+                "error": e.detail,
+            })
+        except Exception as e:
+            results.append({
+                "tool_name": req.tool_name,
+                "success": False,
+                "error": str(e),
+            })
+    
+    return {
+        "object": "tool.batch",
+        "results": results,
+        "total": len(results),
+    }
+
+
+@app.get("/mcp/connectors", tags=["MCP Compatible"])
 async def list_connectors(user: Dict = Depends(get_current_user)):
     """List all registered connectors and their status."""
     return state.connectors.list_connectors()
 
 
-@app.post("/mcp/connectors/{connector_name}/health")
+@app.post("/mcp/connectors/{connector_name}/health", tags=["MCP Compatible"])
 async def check_connector_health(
     connector_name: str,
     user: Dict = Depends(get_current_user),
@@ -536,7 +852,7 @@ class ToolCallRequest(BaseModel):
     timeout: int = 120
 
 
-@app.post("/mcp/call")
+@app.post("/mcp/call", tags=["MCP Compatible"])
 async def call_tool(
     req: ToolCallRequest,
     user: Dict = Depends(get_current_user),

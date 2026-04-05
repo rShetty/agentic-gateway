@@ -360,9 +360,24 @@ async def lifespan(app: FastAPI):
         connectors=connectors,
     )
     
-    logger.info(f"MCP Gateway started on {config.server.host}:{config.server.port}")
+    # Mount per-connector MCP servers on /mcp/{connector}
+    connector_session_managers = []
+    for conn_name in ConnectorRegistry.CONNECTOR_TYPES:
+        connector_mcp = create_connector_mcp_server(conn_name, app_state=state)
+        if connector_mcp is not None:
+            connector_asgi = connector_mcp.streamable_http_app()
+            connector_session_managers.append(connector_mcp._session_manager)
+            mount_path = f"/mcp/{conn_name}"
+            app.mount(mount_path, connector_asgi)
+            logger.info(f"Mounted connector MCP server: {mount_path}")
     
-    yield
+    # Start all connector session managers
+    from contextlib import AsyncExitStack
+    async with AsyncExitStack() as stack:
+        for sm in connector_session_managers:
+            await stack.enter_async_context(sm.run())
+        logger.info(f"MCP Gateway started on {config.server.host}:{config.server.port}")
+        yield
     
     # Shutdown
     await backends.stop()
@@ -1730,6 +1745,147 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
             return json.dumps({"error": "Invalid JSON in arguments"})
         return await _execute_discovered_tool(tool_name, args, authorization)
     
+    return mcp
+
+
+# -----------------------------------------------------------------------------
+# Per-Connector MCP Servers
+# -----------------------------------------------------------------------------
+
+def create_connector_mcp_server(
+    connector_name: str,
+    app_state: Optional["AppState"] = None,
+) -> Optional[Any]:
+    """
+    Create an MCP server that exposes all tools from a single connector
+    as native MCP tools.
+
+    Each connector (github, slack, linear, openai, anthropic) gets its own
+    FastMCP instance with proper tool schemas and native discovery.
+
+    Args:
+        connector_name: Name of the connector (e.g. "github", "slack")
+        app_state: Application state. If None, uses global state.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:
+        logger.error("MCP SDK not installed. Run: pip install mcp")
+        return None
+
+    if app_state is None:
+        app_state = state
+
+    if app_state is None:
+        logger.error("Cannot create connector MCP server: app_state is None")
+        return None
+
+    connector = app_state.connectors.get_connector(connector_name)
+    if connector is None:
+        logger.error(f"Connector '{connector_name}' not found")
+        return None
+
+    tools = connector.get_tools()
+    if not tools:
+        logger.warning(f"Connector '{connector_name}' has no tools")
+        return None
+
+    mcp = FastMCP(
+        f"gateway-{connector_name}",
+        instructions=f"{connector.display_name}: {connector.description}",
+        stateless_http=True,
+    )
+
+    for tool_def in tools:
+        tool_name = tool_def.name
+        tool_desc = tool_def.description
+        tool_params = tool_def.parameters
+
+        schema_params = tool_params.get("properties", {})
+        required = tool_params.get("required", [])
+
+        params = []
+        for pname in schema_params:
+            if pname in required:
+                params.append(f"{pname}: str")
+        for pname in schema_params:
+            if pname not in required:
+                params.append(f"{pname}: Optional[str] = None")
+        if params:
+            params_str = ", ".join(params) + ", ctx: Context = None"
+        else:
+            params_str = "ctx: Context = None"
+
+        fn_code = f"""
+async def tool_fn({params_str}) -> str:
+    _tool_param_names = {list(schema_params.keys())}
+    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
+
+    auth_val = None
+    try:
+        if ctx is not None and ctx.request_context is not None:
+            req = ctx.request_context.request
+            if req is not None:
+                auth_val = req.headers.get("Authorization")
+    except Exception:
+        pass
+
+    requires_auth = {tool_def.requires_auth}
+    if requires_auth and auth_val:
+        token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
+        user_info = app_state.oauth.validate_access_token(token)
+    elif requires_auth:
+        user_info = None
+    else:
+        user_info = {{"user_id": "anonymous"}}
+
+    if requires_auth and not user_info:
+        return json.dumps({{"error": f"Authentication required for '{tool_name}'"}})
+
+    user_id = user_info.get("user_id") if user_info else None
+    user_token = None
+
+    if user_id and requires_auth:
+        from auth.token_store import get_token_store
+        user_token = await get_token_store().get_token(user_id, "{connector_name}")
+        if not user_token:
+            user_token = await get_token_store().get_token("default", "{connector_name}")
+
+    if requires_auth and not user_token:
+        return json.dumps({{
+            "error": f"No credentials for '{connector_name}'",
+            "hint": f"Store a token via POST /v1/tokens or visit /oauth/authorize/{connector_name}",
+        }})
+
+    success, result = await app_state.connectors.call_tool(
+        tool_name="{tool_name}",
+        arguments=kwargs,
+        user_token=user_token,
+    )
+
+    if not success:
+        return json.dumps({{"error": result}})
+    return json.dumps({{"result": result}})
+"""
+        local_ns: Dict[str, Any] = {
+            "app_state": app_state,
+            "json": json,
+            "Optional": Optional,
+            "Context": None,
+        }
+        try:
+            from mcp.server.fastmcp import Context
+            local_ns["Context"] = Context
+        except ImportError:
+            pass
+
+        exec(fn_code, local_ns, local_ns)
+        tool_fn = local_ns["tool_fn"]
+        tool_fn.__name__ = tool_name
+        tool_fn.__doc__ = tool_desc
+
+        mcp.tool()(tool_fn)
+
     return mcp
 
 

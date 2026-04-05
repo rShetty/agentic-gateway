@@ -796,7 +796,25 @@ def set_connector_permission(
     """Set or update connector permission for a user."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    tools_json = json.dumps(tools) if tools else None
+    
+    # Get existing permission to merge tools incrementally
+    existing_perm = get_connector_permission(user_id, connector_name)
+    existing_tools = existing_perm.get("tools") if existing_perm else None
+    
+    # If tools is None, it means "all tools" - no need to merge
+    if tools is None:
+        merged_tools = None
+    # If existing tools is None, it means user had "all tools" access
+    elif existing_tools is None:
+        # If user had all tools and now requesting specific tools, 
+        # we keep the specific tools (could be seen as restricting)
+        merged_tools = tools
+    # If both are specific tool lists, merge them (union)
+    else:
+        # Convert to sets for union operation, then back to list
+        merged_tools = list(set(existing_tools) | set(tools))
+    
+    tools_json = json.dumps(merged_tools) if merged_tools else None
     
     conn.execute("""
         INSERT OR REPLACE INTO connector_permissions 

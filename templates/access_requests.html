@@ -373,6 +373,13 @@
     
     <script>
         const connectorTools = {{ connector_tools | tojson }};
+        const userPermissions = {{ user_permissions | tojson }};
+        
+        // Find existing permissions for a connector
+        function getExistingToolsForConnector(connectorName) {
+            const perm = userPermissions.find(p => p.connector_name === connectorName);
+            return perm && perm.tools ? new Set(perm.tools) : null;
+        }
         
         function updateToolDropdown(connectorName) {
             const container = document.getElementById('tool-selector');
@@ -385,10 +392,17 @@
             }
             
             const tools = connectorTools[connectorName];
-            container.innerHTML = tools.map(tool => 
-                `<label><input type="checkbox" name="tool_sel" value="${tool}" onchange="updateSelectedTools()">${tool}</label>`
-            ).join('');
-            hiddenInput.value = '';
+            const existingToolsSet = getExistingToolsForConnector(connectorName);
+            
+            container.innerHTML = tools.map(tool => {
+                // Check if user already has access to this tool
+                const isChecked = existingToolsSet && existingToolsSet.has(tool);
+                return `<label><input type="checkbox" name="tool_sel" value="${tool}" ${isChecked ? 'checked' : ''} onchange="updateSelectedTools()">${tool}</label>`;
+            }).join('');
+            
+            // Set initial value in hidden input
+            const initialTools = existingToolsSet ? Array.from(existingToolsSet) : [];
+            hiddenInput.value = JSON.stringify(initialTools);
         }
         
         function updateSelectedTools() {

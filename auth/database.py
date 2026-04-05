@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import logging
 
+# Import encryption utilities
+from .encryption import encrypt_data, decrypt_data
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("MCP_GATEWAY_DB_PATH", "data/gateway.db")
@@ -225,11 +228,13 @@ def save_oauth_client(
     """Save or update OAuth client."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    # Encrypt client secret if provided
+    encrypted_secret = encrypt_data(client_secret) if client_secret else None
     conn.execute("""
         INSERT OR REPLACE INTO oauth_clients 
         (client_id, client_name, client_secret, redirect_uris, is_confidential, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (client_id, client_name, client_secret, json.dumps(redirect_uris), 
+    """, (client_id, client_name, encrypted_secret, json.dumps(redirect_uris), 
           1 if is_confidential else 0, now, now))
     conn.commit()
 
@@ -245,7 +250,7 @@ def get_oauth_client(client_id: str) -> Optional[Dict[str, Any]]:
     return {
         "client_id": row["client_id"],
         "client_name": row["client_name"],
-        "client_secret": row["client_secret"],
+        "client_secret": decrypt_data(row["client_secret"]) if row["client_secret"] else None,
         "redirect_uris": json.loads(row["redirect_uris"]),
         "is_confidential": bool(row["is_confidential"]),
     }
@@ -254,19 +259,25 @@ def get_oauth_client(client_id: str) -> Optional[Dict[str, Any]]:
 def get_oauth_client_by_secret(client_id: str, client_secret: str) -> Optional[Dict[str, Any]]:
     """Get OAuth client by ID and verify secret."""
     conn = get_connection()
+    # Get the stored encrypted secret and decrypt it for comparison
     row = conn.execute(
-        "SELECT * FROM oauth_clients WHERE client_id = ? AND client_secret = ?", 
-        (client_id, client_secret)
+        "SELECT * FROM oauth_clients WHERE client_id = ?", 
+        (client_id,)
     ).fetchone()
     if not row:
         return None
-    return {
-        "client_id": row["client_id"],
-        "client_name": row["client_name"],
-        "client_secret": row["client_secret"],
-        "redirect_uris": json.loads(row["redirect_uris"]),
-        "is_confidential": bool(row["is_confidential"]),
-    }
+    
+    # Decrypt the stored secret and compare with provided secret
+    stored_secret = decrypt_data(row["client_secret"]) if row["client_secret"] else None
+    if stored_secret == client_secret:
+        return {
+            "client_id": row["client_id"],
+            "client_name": row["client_name"],
+            "client_secret": stored_secret,
+            "redirect_uris": json.loads(row["redirect_uris"]),
+            "is_confidential": bool(row["is_confidential"]),
+        }
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -284,11 +295,14 @@ def save_user_credential(
     """Save or update user credential (JWT token)."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    # Encrypt sensitive token fields
+    encrypted_access_token = encrypt_data(access_token)
+    encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else None
     conn.execute("""
         INSERT OR REPLACE INTO user_credentials 
         (user_id, client_id, access_token, refresh_token, token_type, expires_at, scope, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, client_id, access_token, refresh_token, "Bearer", expires_at, scope, now, now))
+    """, (user_id, client_id, encrypted_access_token, encrypted_refresh_token, "Bearer", expires_at, scope, now, now))
     conn.commit()
 
 
@@ -301,7 +315,11 @@ def get_user_credential(user_id: str, client_id: str) -> Optional[Dict[str, Any]
     ).fetchone()
     if not row:
         return None
-    return dict(row)
+    # Decrypt sensitive token fields
+    result = dict(row)
+    result["access_token"] = decrypt_data(result["access_token"]) if result["access_token"] else None
+    result["refresh_token"] = decrypt_data(result["refresh_token"]) if result["refresh_token"] else None
+    return result
 
 
 def get_user_credentials_by_user(user_id: str) -> List[Dict[str, Any]]:
@@ -310,7 +328,14 @@ def get_user_credentials_by_user(user_id: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM user_credentials WHERE user_id = ?", (user_id,)
     ).fetchall()
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        result = dict(row)
+        # Decrypt sensitive token fields
+        result["access_token"] = decrypt_data(result["access_token"]) if result["access_token"] else None
+        result["refresh_token"] = decrypt_data(result["refresh_token"]) if result["refresh_token"] else None
+        results.append(result)
+    return results
 
 
 def delete_user_credential(user_id: str, client_id: str) -> bool:
@@ -340,11 +365,14 @@ def save_connector_token(
     """Save or update connector token for a user."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    # Encrypt sensitive token fields
+    encrypted_token = encrypt_data(token)
+    encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else None
     conn.execute("""
         INSERT OR REPLACE INTO connector_tokens 
         (user_id, connector_name, token, token_type, refresh_token, expires_at, metadata, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, connector_name, token, token_type, refresh_token, expires_at, 
+    """, (user_id, connector_name, encrypted_token, token_type, encrypted_refresh_token, expires_at, 
           json.dumps(metadata) if metadata else None, now, now))
     conn.commit()
 
@@ -356,7 +384,9 @@ def get_connector_token(user_id: str, connector_name: str) -> Optional[str]:
         "SELECT token FROM connector_tokens WHERE user_id = ? AND connector_name = ?",
         (user_id, connector_name)
     ).fetchone()
-    return row["token"] if row else None
+    if row and row["token"]:
+        return decrypt_data(row["token"])
+    return None
 
 
 def get_connector_token_full(user_id: str, connector_name: str) -> Optional[Dict[str, Any]]:
@@ -366,7 +396,13 @@ def get_connector_token_full(user_id: str, connector_name: str) -> Optional[Dict
         "SELECT * FROM connector_tokens WHERE user_id = ? AND connector_name = ?",
         (user_id, connector_name)
     ).fetchone()
-    return dict(row) if row else None
+    if row:
+        result = dict(row)
+        # Decrypt sensitive token fields
+        result["token"] = decrypt_data(result["token"]) if result["token"] else None
+        result["refresh_token"] = decrypt_data(result["refresh_token"]) if result["refresh_token"] else None
+        return result
+    return None
 
 
 def list_user_connectors(user_id: str) -> List[str]:

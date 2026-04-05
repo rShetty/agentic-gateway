@@ -1277,6 +1277,7 @@ async def admin_page(request: Request):
         default_permissions=default_perms,
         all_user_permissions=all_user_perms,
         connector_tools=connector_tools,
+        user_permissions=all_user_perms,  # Pass for editing
     )
 
 
@@ -1395,13 +1396,45 @@ async def my_access_requests_page(request: Request):
     if not user:
         return RedirectResponse(url="/auth/login")
     
-    from auth.database import get_user_access_requests
+    # Admins should use the admin panel
+    if user.get("is_admin"):
+        return RedirectResponse(url="/admin")
+    
+    from auth.database import get_user_access_requests, get_user_permissions
     requests = get_user_access_requests(user["id"])
+    permissions = get_user_permissions(user["id"])
+    
+    is_admin = user.get("is_admin", False)
+    
+    # Get available tools for each connector
+    app_state = _get_state()
+    connector_tools = {}
+    for conn in app_state.connectors.list_connectors():
+        name = conn.get("name")
+        tools = []
+        conn_obj = app_state.connectors.get_connector(name)
+        if conn_obj:
+            try:
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        tools = conn_obj.get_tools()
+                    else:
+                        tools = loop.run_until_complete(conn_obj.get_tools_async())
+                except RuntimeError:
+                    tools = asyncio.run(conn_obj.get_tools_async())
+            except Exception:
+                tools = conn_obj.get_tools()
+        connector_tools[name] = [t.name for t in tools]
     
     return render_template(
         "access_requests.html",
         user=user,
         requests=requests,
+        is_admin=is_admin,
+        connector_tools=connector_tools,
+        user_permissions=permissions,
     )
 
 

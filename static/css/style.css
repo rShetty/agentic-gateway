@@ -797,3 +797,16 @@ a:hover { color: var(--accent-hover); }
     background: var(--warning);
     color: white;
 }
+
+.info-box {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 24px;
+}
+
+.info-box p {
+    margin: 0;
+    color: var(--accent);
+}

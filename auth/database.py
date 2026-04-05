@@ -566,7 +566,7 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
         "username": row["username"],
         "email": row["email"],
         "is_active": bool(row["is_active"]),
-        "is_admin": bool(row.get("is_admin", 0)),
+        "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False,
         "created_at": row["created_at"],
     }
 

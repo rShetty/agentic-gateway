@@ -3,82 +3,400 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Access Requests - Relay</title>
+    <title>My Access - Relay</title>
     <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .my-access-page { max-width: 1000px; }
+        
+        .current-access {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        
+        .current-access h2 {
+            font-size: 16px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .connector-access {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        
+        .connector-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 14px;
+            min-width: 200px;
+            flex: 1;
+        }
+        
+        .connector-card h4 {
+            font-size: 14px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .access-badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .access-badge.all {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+        .access-badge.limited {
+            background: var(--accent-bg);
+            color: var(--accent);
+        }
+        
+        .tool-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 8px;
+        }
+        
+        .tool-chip {
+            padding: 2px 6px;
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+        
+        /* Request form */
+        .request-form {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        
+        .request-form h2 {
+            font-size: 16px;
+            margin-bottom: 16px;
+        }
+        
+        .form-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .form-group {
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+        
+        .form-group select,
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        
+        .form-group select:focus,
+        .form-group input:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .tool-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding: 10px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            min-height: 42px;
+        }
+        
+        .tool-selector label {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 8px;
+            background: var(--bg-secondary);
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        
+        .tool-selector label:has(input:checked) {
+            background: var(--accent);
+            color: white;
+        }
+        
+        .tool-selector input { display: none; }
+        
+        /* Requests table */
+        .requests-section h2 {
+            font-size: 16px;
+            margin-bottom: 12px;
+        }
+        
+        .data-table-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+        }
+        
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        .data-table th {
+            background: var(--bg-tertiary);
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 12px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+        
+        .data-table td {
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .data-table tr:last-child td { border-bottom: none; }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .status-badge.status-connected { background: var(--success-bg); color: var(--success); }
+        .status-badge.status-disconnected { background: var(--danger-bg); color: var(--danger); }
+        .status-badge.status-pending { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+        
+        .btn {
+            padding: 10px 16px;
+            border-radius: var(--radius);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        
+        .btn-primary:hover { background: var(--accent-hover); }
+        
+        .info-box {
+            background: var(--accent-bg);
+            border: 1px solid var(--accent);
+            border-radius: var(--radius);
+            padding: 16px;
+            margin-bottom: 24px;
+            color: var(--accent);
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-muted);
+        }
+    </style>
 </head>
 <body>
     {% extends "base.html" %}
     {% set show_sidebar = true %}
     {% set active_page = "access-requests" %}
-    {% block page_title %}My Access Requests{% endblock %}
+    {% block page_title %}My Access{% endblock %}
     {% block content %}
-    <div class="access-requests-page">
-        <h1>My Access Requests</h1>
+    <div class="my-access-page">
+        <h1 style="margin-bottom: 24px;">My Access</h1>
         
+        {% if user.is_admin %}
+        <div class="info-box">
+            As an admin, you have full access to all connectors and tools. No access requests needed.
+        </div>
+        {% endif %}
+        
+        <!-- Current Access Section -->
+        <div class="current-access">
+            <h2>📋 Your Current Access</h2>
+            {% if user_permissions %}
+            <div class="connector-access">
+                {% for perm in user_permissions %}
+                <div class="connector-card">
+                    <h4>
+                        {{ perm.connector_name }}
+                        {% if perm.tools %}
+                        <span class="access-badge limited">{{ perm.tools|length }} tools</span>
+                        {% else %}
+                        <span class="access-badge all">Full Access</span>
+                        {% endif %}
+                    </h4>
+                    {% if perm.tools %}
+                    <div class="tool-list">
+                        {% for tool in perm.tools %}
+                        <span class="tool-chip">{{ tool }}</span>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p style="color: var(--text-muted);">You have full access to all connectors.</p>
+            {% endif %}
+        </div>
+        
+        {% if not user.is_admin %}
+        <!-- Request Form -->
         <div class="request-form">
-            <h2>Request New Access</h2>
+            <h2>📝 Request Additional Access</h2>
             <form action="/access-requests" method="post">
-                <div class="form-group">
-                    <label for="connector_name">Connector</label>
-                    <select name="connector_name" id="connector_name" required>
-                        <option value="">Select a connector</option>
-                        <option value="github">GitHub</option>
-                        <option value="slack">Slack</option>
-                        <option value="linear">Linear</option>
-                        <option value="openai">OpenAI</option>
-                        <option value="anthropic">Anthropic</option>
-                    </select>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="connector_name">Connector</label>
+                        <select name="connector_name" id="connector_name" required onchange="updateToolDropdown(this.value)">
+                            <option value="">Select a connector</option>
+                            <option value="github">GitHub</option>
+                            <option value="slack">Slack</option>
+                            <option value="linear">Linear</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic</option>
+                        </select>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label for="requested_tools">Specific Tools (optional)</label>
-                    <input type="text" name="requested_tools" id="requested_tools" placeholder='["tool1", "tool2"] - leave empty for all tools'>
-                    <p class="help-text">Enter a JSON array of tool names you need access to. Leave empty to request all tools.</p>
+                
+                <div class="form-group" style="margin-bottom: 12px;">
+                    <label>Select Tools (leave empty for full access)</label>
+                    <div id="tool-selector" class="tool-selector">
+                        <span style="color: var(--text-muted); font-size: 13px;">Select a connector first</span>
+                    </div>
+                    <input type="hidden" name="requested_tools" id="requested_tools" value="">
                 </div>
+                
                 <div class="form-group">
-                    <label for="reason">Reason</label>
-                    <textarea name="reason" id="reason" rows="3" placeholder="Why do you need access to this connector?"></textarea>
+                    <label for="reason">Reason for Request</label>
+                    <textarea name="reason" id="reason" rows="2" placeholder="Why do you need access to this connector?"></textarea>
                 </div>
+                
                 <button type="submit" class="btn btn-primary">Submit Request</button>
             </form>
         </div>
+        {% endif %}
         
-        <div class="requests-list">
-            <h2>Your Requests</h2>
+        <!-- My Requests Section -->
+        <div class="requests-section">
+            <h2>📬 My Access Requests</h2>
             {% if requests %}
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Connector</th>
-                        <th>Requested Tools</th>
-                        <th>Reason</th>
-                        <th>Status</th>
-                        <th>Requested</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for req in requests %}
-                    <tr>
-                        <td>{{ req.connector_name }}</td>
-                        <td>{{ req.requested_tools|join(', ') if req.requested_tools else 'All tools' }}</td>
-                        <td>{{ req.reason or '-' }}</td>
-                        <td>
-                            <span class="status-badge 
-                                {% if req.status == 'approved' %}status-connected
-                                {% elif req.status == 'rejected' %}status-disconnected
-                                {% else %}status-pending{% endif %}">
-                                {{ req.status }}
-                            </span>
-                        </td>
-                        <td>{{ req.requested_at }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="data-table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Connector</th>
+                            <th>Tools</th>
+                            <th>Reason</th>
+                            <th>Status</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for req in requests %}
+                        <tr>
+                            <td><strong>{{ req.connector_name }}</strong></td>
+                            <td>
+                                {% if req.requested_tools %}
+                                <div class="tool-list">
+                                    {% for tool in req.requested_tools %}
+                                    <span class="tool-chip">{{ tool }}</span>
+                                    {% endfor %}
+                                </div>
+                                {% else %}
+                                <span class="access-badge all">Full Access</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ req.reason or '-' }}</td>
+                            <td>
+                                <span class="status-badge 
+                                    {% if req.status == 'approved' %}status-connected
+                                    {% elif req.status == 'rejected' %}status-disconnected
+                                    {% else %}status-pending{% endif %}">
+                                    {{ req.status }}
+                                </span>
+                            </td>
+                            <td>{{ req.requested_at[:10] }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% else %}
-            <p class="empty-state">You haven't made any access requests yet.</p>
+            <div class="empty-state">You haven't made any access requests yet.</div>
             {% endif %}
         </div>
     </div>
+    
+    <script>
+        const connectorTools = {{ connector_tools | tojson }};
+        
+        function updateToolDropdown(connectorName) {
+            const container = document.getElementById('tool-selector');
+            const hiddenInput = document.getElementById('requested_tools');
+            
+            if (!connectorName || !connectorTools[connectorName]) {
+                container.innerHTML = '<span style="color: var(--text-muted); font-size: 13px;">Select a connector first</span>';
+                hiddenInput.value = '';
+                return;
+            }
+            
+            const tools = connectorTools[connectorName];
+            container.innerHTML = tools.map(tool => 
+                `<label><input type="checkbox" name="tool_sel" value="${tool}" onchange="updateSelectedTools()">${tool}</label>`
+            ).join('');
+            hiddenInput.value = '';
+        }
+        
+        function updateSelectedTools() {
+            const checkboxes = document.querySelectorAll('input[name="tool_sel"]:checked');
+            const tools = Array.from(checkboxes).map(cb => cb.value);
+            document.getElementById('requested_tools').value = JSON.stringify(tools);
+        }
+    </script>
     {% endblock %}
 </body>
 </html>

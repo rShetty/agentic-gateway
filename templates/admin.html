@@ -14,13 +14,14 @@
             padding-bottom: 12px;
         }
         .admin-tab {
-            padding: 8px 16px;
+            padding: 10px 20px;
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
             border-radius: var(--radius);
             color: var(--text-secondary);
             cursor: pointer;
             transition: all 0.2s;
+            font-weight: 500;
         }
         .admin-tab.active {
             background: var(--accent);
@@ -29,89 +30,222 @@
         }
         .admin-tab:hover:not(.active) {
             background: var(--bg-hover);
+            color: var(--text-primary);
         }
-        .tab-content {
-            display: none;
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        /* Search bar */
+        .search-bar {
+            position: relative;
+            margin-bottom: 20px;
         }
-        .tab-content.active {
-            display: block;
+        .search-bar input {
+            width: 100%;
+            padding: 12px 16px 12px 44px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-size: 14px;
         }
-        .user-card {
+        .search-bar input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+        .search-bar::before {
+            content: "🔍";
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 14px;
+            opacity: 0.5;
+        }
+        
+        /* Rich Data Table */
+        .data-table-container {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: var(--radius-lg);
-            padding: 16px;
-            margin-bottom: 16px;
+            overflow: hidden;
         }
-        .user-card-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
         }
-        .user-card-header h3 {
-            margin: 0;
-            font-size: 16px;
-        }
-        .perm-badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
+        .data-table th {
+            background: var(--bg-tertiary);
+            padding: 14px 16px;
+            text-align: left;
+            font-weight: 600;
             font-size: 12px;
-            margin-right: 4px;
-            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
         }
-        .perm-badge.all {
+        .data-table td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            vertical-align: middle;
+        }
+        .data-table tr:last-child td {
+            border-bottom: none;
+        }
+        .data-table tbody tr {
+            transition: background 0.15s;
+        }
+        .data-table tbody tr:hover {
+            background: var(--bg-hover);
+        }
+        
+        /* Status badges */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-badge.status-connected {
             background: var(--success-bg);
             color: var(--success);
         }
-        .perm-badge.limited {
-            background: var(--accent-bg);
-            color: var(--accent);
+        .status-badge.status-disconnected {
+            background: var(--danger-bg);
+            color: var(--danger);
         }
-        .permission-connector {
-            margin-top: 12px;
+        .status-badge.status-pending {
+            background: rgba(245, 158, 11, 0.15);
+            color: #f59e0b;
         }
-        .permission-connector h4 {
-            font-size: 14px;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-        }
-        .tool-list {
+        
+        /* Tool chips */
+        .tool-tags {
             display: flex;
             flex-wrap: wrap;
             gap: 4px;
         }
-        .tool-chip {
-            padding: 2px 8px;
+        .tool-tag {
+            display: inline-block;
+            padding: 3px 8px;
             background: var(--bg-tertiary);
             border-radius: 4px;
             font-size: 11px;
             color: var(--text-secondary);
         }
-        .tool-chip.granted {
+        .tool-tag.granted {
             background: var(--success-bg);
             color: var(--success);
         }
-        .tool-chip.denied {
-            background: var(--danger-bg);
-            color: var(--danger);
-            text-decoration: line-through;
-            opacity: 0.6;
-        }
-        .inline-form {
+        
+        /* Action buttons */
+        .action-btns {
             display: flex;
             gap: 8px;
-            align-items: center;
-            flex-wrap: wrap;
         }
-        .inline-form select,
-        .inline-form input {
-            padding: 8px 12px;
+        .btn {
+            padding: 8px 14px;
+            border-radius: var(--radius);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-danger {
+            background: var(--danger-bg);
+            color: var(--danger);
+        }
+        .btn-danger:hover { background: var(--danger); color: white; }
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        
+        /* Expandable row */
+        .expand-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 6px 12px;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .expand-btn:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .user-detail {
+            display: none;
+            background: var(--bg-primary);
+            padding: 20px;
+        }
+        .user-detail.show { display: table-row; }
+        .user-detail td {
+            padding: 20px !important;
+            background: var(--bg-primary);
+        }
+        
+        /* Tool selector in forms */
+        .tool-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding: 10px;
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
             border-radius: var(--radius);
-            color: var(--text-primary);
+            max-width: 400px;
+        }
+        .tool-selector label {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 5px 10px;
+            background: var(--bg-secondary);
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .tool-selector label:hover {
+            background: var(--bg-hover);
+        }
+        .tool-selector label:has(input:checked) {
+            background: var(--accent);
+            color: white;
+        }
+        .tool-selector input { display: none; }
+        
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+        
+        /* Section headers */
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .section-header h2 {
+            font-size: 18px;
+            font-weight: 600;
         }
     </style>
 </head>
@@ -122,155 +256,257 @@
     {% block page_title %}Admin Dashboard{% endblock %}
     {% block content %}
     <div class="admin-dashboard">
-        <h1>Admin Dashboard</h1>
-        
-        <div class="admin-tabs">
-            <button class="admin-tab active" onclick="showTab('users')">Users & Permissions</button>
-            <button class="admin-tab" onclick="showTab('requests')">Access Requests</button>
-            <button class="admin-tab" onclick="showTab('defaults')">Default Permissions</button>
+        <div class="section-header">
+            <h1>Admin Dashboard</h1>
         </div>
         
-        <!-- Users & Permissions Tab -->
+        <div class="admin-tabs">
+            <button class="admin-tab active" onclick="showTab('users')">Users</button>
+            <button class="admin-tab" onclick="showTab('requests')">Access Requests</button>
+            <button class="admin-tab" onclick="showTab('defaults')">Defaults</button>
+        </div>
+        
+        <!-- Users Tab -->
         <div id="tab-users" class="tab-content active">
-            {% for u in users %}
-            <div class="user-card">
-                <div class="user-card-header">
-                    <div>
-                        <h3>{{ u.username }}</h3>
-                        <span style="color: var(--text-secondary); font-size: 13px;">{{ u.email or 'No email' }}</span>
-                    </div>
-                    <div>
-                        {% if u.is_admin %}
-                        <span class="status-badge status-connected">Admin</span>
-                        {% else %}
-                        <form action="/admin/users/{{ u.id }}/set-admin" method="post" style="display:inline;">
-                            <button type="submit" class="btn btn-sm">Make Admin</button>
-                        </form>
-                        {% endif %}
-                    </div>
-                </div>
-                
-                <div class="permission-connector">
-                    <h4>Connector Permissions</h4>
-                    {% set user_perms = all_user_permissions[u.id] %}
-                    {% if user_perms %}
-                        {% for perm in user_perms %}
-                        <div style="margin-bottom: 12px;">
-                            <strong>{{ perm.connector_name }}</strong>
-                            {% if perm.tools %}
-                                <div class="tool-list">
-                                    {% for tool in connector_tools[perm.connector_name] %}
-                                    <span class="tool-chip {% if tool in perm.tools %}granted{% else %}denied{% endif %}">
-                                        {{ tool }}
+            <div class="search-bar">
+                <input type="text" id="userSearch" placeholder="Search users by name or email..." onkeyup="filterUsers()">
+            </div>
+            
+            <div class="data-table-container">
+                <table class="data-table" id="usersTable">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Status</th>
+                            <th>Role</th>
+                            <th>Permissions</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for u in users %}
+                        <tr class="user-row" data-username="{{ u.username }}" data-email="{{ u.email or '' }}">
+                            <td>
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <div style="width: 36px; height: 36px; background: var(--accent-bg); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: var(--accent);">
+                                        {{ u.username[0]|upper }}
+                                    </div>
+                                    <div>
+                                        <div style="font-weight: 500;">{{ u.username }}</div>
+                                        <div style="font-size: 12px; color: var(--text-muted);">{{ u.email or 'No email' }}</div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td>
+                                <span class="status-badge {{ 'status-connected' if u.is_active else 'status-disconnected' }}">
+                                    {{ 'Active' if u.is_active else 'Inactive' }}
+                                </span>
+                            </td>
+                            <td>
+                                {% if u.is_admin %}
+                                <span class="status-badge status-connected">Admin</span>
+                                {% else %}
+                                <span style="color: var(--text-muted);">User</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% set user_perms = all_user_permissions[u.id] %}
+                                {% if user_perms %}
+                                <div class="tool-tags">
+                                    {% for perm in user_perms %}
+                                    <span class="tool-tag {{ 'granted' if perm.tools else '' }}">
+                                        {{ perm.connector_name }}{% if perm.tools %} ({{ perm.tools|length }}){% else %} (all){% endif %}
                                     </span>
                                     {% endfor %}
                                 </div>
-                            {% else %}
-                                <span class="perm-badge all">All Tools</span>
-                            {% endif %}
-                        </div>
+                                {% else %}
+                                <span style="color: var(--text-muted); font-size: 13px;">Full access</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <div class="action-btns">
+                                    {% if not u.is_admin %}
+                                    <form action="/admin/users/{{ u.id }}/set-admin" method="post">
+                                        <button type="submit" class="btn btn-sm">Promote</button>
+                                    </form>
+                                    {% else %}
+                                    <form action="/admin/users/{{ u.id }}/remove-admin" method="post">
+                                        <button type="submit" class="btn btn-sm btn-danger">Demote</button>
+                                    </form>
+                                    {% endif %}
+                                    <button class="expand-btn" onclick="toggleUserDetail('{{ u.id }}')">⚙️ Edit</button>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="5" style="padding: 0; border: none;">
+                                <div id="user-detail-{{ u.id }}" class="user-detail">
+                                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                                        <h4 style="color: var(--text-secondary); margin: 0;">Update Permissions for {{ u.username }}</h4>
+                                        <span id="current-perms-{{ u.id }}" style="font-size: 12px; color: var(--text-muted);"></span>
+                                    </div>
+                                    <form action="/admin/users/{{ u.id }}/permissions" method="post" style="display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;">
+                                        <div>
+                                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Connector</label>
+                                            <select name="connector_name" id="perm_connector_{{ u.id }}" required onchange="updatePermTools('{{ u.id }}', this.value)" style="padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary); min-width: 180px;">
+                                                <option value="">Select Connector</option>
+                                                <option value="github">GitHub</option>
+                                                <option value="slack">Slack</option>
+                                                <option value="linear">Linear</option>
+                                                <option value="openai">OpenAI</option>
+                                                <option value="anthropic">Anthropic</option>
+                                            </select>
+                                        </div>
+                                        <div style="flex: 1; min-width: 300px;">
+                                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Allowed Tools (select none for full access)</label>
+                                            <div id="perm_tools_{{ u.id }}" class="tool-selector" style="min-height: 50px; padding: 12px;">
+                                                <span style="color: var(--text-muted); font-size: 13px;">Select a connector to see available tools</span>
+                                            </div>
+                                            <input type="hidden" name="tools" id="perm_tools_input_{{ u.id }}" value="">
+                                        </div>
+                                        <div style="align-self: flex-end;">
+                                            <button type="submit" class="btn btn-primary btn-sm">Update</button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </td>
+                        </tr>
                         {% endfor %}
-                    {% else %}
-                        <span style="color: var(--text-muted);">No specific permissions (all access)</span>
-                    {% endif %}
-                </div>
-                
-                <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color);">
-                    <form action="/admin/users/{{ u.id }}/permissions" method="post" class="inline-form">
-                        <select name="connector_name" required>
-                            <option value="">Select Connector</option>
-                            <option value="github">GitHub</option>
-                            <option value="slack">Slack</option>
-                            <option value="linear">Linear</option>
-                            <option value="openai">OpenAI</option>
-                            <option value="anthropic">Anthropic</option>
-                        </select>
-                        <input type="text" name="tools" placeholder='["tool1", "tool2"] or empty for all'>
-                        <button type="submit" class="btn btn-sm btn-primary">Update Permission</button>
-                    </form>
-                </div>
+                    </tbody>
+                </table>
             </div>
-            {% endfor %}
         </div>
         
         <!-- Access Requests Tab -->
         <div id="tab-requests" class="tab-content">
-            <h2>Pending Access Requests</h2>
+            <div class="section-header">
+                <h2>Pending Requests</h2>
+            </div>
             {% if pending_requests %}
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>User</th>
-                        <th>Connector</th>
-                        <th>Requested Tools</th>
-                        <th>Reason</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for req in pending_requests %}
-                    <tr>
-                        <td>{{ req.username }}</td>
-                        <td>{{ req.connector_name }}</td>
-                        <td>{{ req.requested_tools|join(', ') if req.requested_tools else 'All tools' }}</td>
-                        <td>{{ req.reason or '-' }}</td>
-                        <td>
-                            <form action="/admin/access-requests/{{ req.id }}/approve" method="post" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-primary">Approve</button>
-                            </form>
-                            <form action="/admin/access-requests/{{ req.id }}/reject" method="post" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-danger">Reject</button>
-                            </form>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="data-table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Connector</th>
+                            <th>Tools</th>
+                            <th>Reason</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for req in pending_requests %}
+                        <tr>
+                            <td>
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <div style="width: 32px; height: 32px; background: var(--accent-bg); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: var(--accent); font-size: 13px;">
+                                        {{ req.username[0]|upper }}
+                                    </div>
+                                    {{ req.username }}
+                                </div>
+                            </td>
+                            <td><strong>{{ req.connector_name }}</strong></td>
+                            <td>
+                                {% if req.requested_tools %}
+                                <div class="tool-tags">
+                                    {% for tool in req.requested_tools %}
+                                    <span class="tool-tag">{{ tool }}</span>
+                                    {% endfor %}
+                                </div>
+                                {% else %}
+                                <span class="tool-tag granted">All tools</span>
+                                {% endif %}
+                            </td>
+                            <td style="max-width: 200px; color: var(--text-secondary);">{{ req.reason or '-' }}</td>
+                            <td>
+                                <div class="action-btns">
+                                    <form action="/admin/access-requests/{{ req.id }}/approve" method="post">
+                                        <button type="submit" class="btn btn-sm btn-primary">✓ Approve</button>
+                                    </form>
+                                    <form action="/admin/access-requests/{{ req.id }}/reject" method="post">
+                                        <button type="submit" class="btn btn-sm btn-danger">✗ Reject</button>
+                                    </form>
+                                </div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% else %}
-            <p class="empty-state">No pending access requests</p>
+            <div class="empty-state">No pending access requests</div>
             {% endif %}
             
-            <h2 style="margin-top: 32px;">All Access Requests</h2>
+            <div class="section-header" style="margin-top: 32px;">
+                <h2>All Requests</h2>
+            </div>
+            <div class="search-bar">
+                <input type="text" id="requestSearch" placeholder="Search requests..." onkeyup="filterRequests()">
+            </div>
             {% if all_requests %}
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>User</th>
-                        <th>Connector</th>
-                        <th>Status</th>
-                        <th>Requested</th>
-                        <th>Reviewed</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for req in all_requests %}
-                    <tr>
-                        <td>{{ req.username }}</td>
-                        <td>{{ req.connector_name }}</td>
-                        <td>
-                            <span class="status-badge 
-                                {% if req.status == 'approved' %}status-connected
-                                {% elif req.status == 'rejected' %}status-disconnected
-                                {% else %}status-pending{% endif %}">
-                                {{ req.status }}
-                            </span>
-                        </td>
-                        <td>{{ req.requested_at }}</td>
-                        <td>{{ req.reviewed_at or '-' }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="data-table-container">
+                <table class="data-table" id="requestsTable">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Connector</th>
+                            <th>Tools</th>
+                            <th>Status</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for req in all_requests %}
+                        <tr class="request-row" data-user="{{ req.username }}" data-connector="{{ req.connector_name }}">
+                            <td>
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <div style="width: 32px; height: 32px; background: var(--bg-tertiary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 13px;">
+                                        {{ req.username[0]|upper }}
+                                    </div>
+                                    {{ req.username }}
+                                </div>
+                            </td>
+                            <td><strong>{{ req.connector_name }}</strong></td>
+                            <td>
+                                {% if req.requested_tools %}
+                                <div class="tool-tags">
+                                    {% for tool in req.requested_tools[:4] %}
+                                    <span class="tool-tag">{{ tool }}</span>
+                                    {% endfor %}
+                                    {% if req.requested_tools|length > 4 %}
+                                    <span class="tool-tag">+{{ req.requested_tools|length - 4 }}</span>
+                                    {% endif %}
+                                </div>
+                                {% else %}
+                                <span class="tool-tag granted">All tools</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span class="status-badge 
+                                    {% if req.status == 'approved' %}status-connected
+                                    {% elif req.status == 'rejected' %}status-disconnected
+                                    {% else %}status-pending{% endif %}">
+                                    {{ req.status }}
+                                </span>
+                            </td>
+                            <td style="color: var(--text-muted); font-size: 13px;">{{ req.requested_at[:10] }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% else %}
-            <p class="empty-state">No access requests</p>
+            <div class="empty-state">No access requests</div>
             {% endif %}
         </div>
         
         <!-- Default Permissions Tab -->
         <div id="tab-defaults" class="tab-content">
-            <h2>Default Permissions for New Users</h2>
-            <form action="/admin/default-permissions" method="post" class="inline-form" style="margin-bottom: 24px;">
-                <select name="connector_name" required>
+            <h2>Default Permissions</h2>
+            <p style="color: var(--text-muted); margin-bottom: 20px;">These permissions are automatically applied to new users.</p>
+            
+            <form action="/admin/default-permissions" method="post" style="display: flex; gap: 12px; align-items: flex-start; margin-bottom: 24px; flex-wrap: wrap;">
+                <select name="connector_name" id="default_connector" required onchange="updateDefaultTools(this.value)" style="padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
                     <option value="">Select Connector</option>
                     <option value="github">GitHub</option>
                     <option value="slack">Slack</option>
@@ -278,40 +514,123 @@
                     <option value="openai">OpenAI</option>
                     <option value="anthropic">Anthropic</option>
                 </select>
-                <input type="text" name="tools" placeholder='["tool1", "tool2"] or leave empty for all'>
+                <div id="default_tools" class="tool-selector" style="flex: 1; min-width: 300px;">
+                    <span style="color: var(--text-muted); font-size: 12px;">Select connector first</span>
+                </div>
+                <input type="hidden" name="tools" id="default_tools_input" value="">
                 <button type="submit" class="btn btn-primary">Set Default</button>
             </form>
             
             {% if default_permissions %}
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Connector</th>
-                        <th>Allowed Tools</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for perm in default_permissions %}
-                    <tr>
-                        <td>{{ perm.connector_name }}</td>
-                        <td>{{ perm.tools|join(', ') if perm.tools else 'All tools' }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="data-table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Connector</th>
+                            <th>Allowed Tools</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for perm in default_permissions %}
+                        <tr>
+                            <td><strong>{{ perm.connector_name }}</strong></td>
+                            <td>
+                                {% if perm.tools %}
+                                <div class="tool-tags">
+                                    {% for tool in perm.tools %}
+                                    <span class="tool-tag granted">{{ tool }}</span>
+                                    {% endfor %}
+                                </div>
+                                {% else %}
+                                <span class="tool-tag granted">All tools</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% else %}
-            <p class="empty-state">No default permissions set</p>
+            <div class="empty-state">No default permissions set</div>
             {% endif %}
         </div>
     </div>
     
     <script>
+        const connectorTools = {{ connector_tools | tojson }};
+        const userPermissions = {{ user_permissions | tojson }};
+        
         function showTab(tabName) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.admin-tab').forEach(el => el.classList.remove('active'));
-            
             document.getElementById('tab-' + tabName).classList.add('active');
             event.target.classList.add('active');
+        }
+        
+        function filterUsers() {
+            const search = document.getElementById('userSearch').value.toLowerCase();
+            document.querySelectorAll('.user-row').forEach(row => {
+                const username = row.dataset.username.toLowerCase();
+                const email = row.dataset.email.toLowerCase();
+                row.style.display = (username.includes(search) || email.includes(search)) ? '' : 'none';
+                row.nextElementSibling.style.display = row.style.display;
+            });
+        }
+        
+        function filterRequests() {
+            const search = document.getElementById('requestSearch').value.toLowerCase();
+            document.querySelectorAll('.request-row').forEach(row => {
+                const user = row.dataset.user.toLowerCase();
+                const connector = row.dataset.connector.toLowerCase();
+                row.style.display = (user.includes(search) || connector.includes(search)) ? '' : 'none';
+            });
+        }
+        
+        function toggleUserDetail(userId) {
+            const detail = document.getElementById('user-detail-' + userId);
+            detail.classList.toggle('show');
+        }
+        
+        function updateToolSelector(containerId, inputId, connectorName) {
+            const container = document.getElementById(containerId);
+            const input = document.getElementById(inputId);
+            if (!connectorName || !connectorTools[connectorName]) {
+                container.innerHTML = '<span style="color: var(--text-muted); font-size: 12px;">Select connector</span>';
+                input.value = '';
+                return;
+            }
+            const tools = connectorTools[connectorName];
+            const userId = containerId.replace('perm_tools_', '');
+            const userPermsArray = userPermissions[userId] || [];
+            
+            // Find permission for this connector
+            const connPerm = userPermsArray.find(p => p.connector_name === connectorName);
+            const allowedTools = connPerm && connPerm.tools ? connPerm.tools : [];
+            
+            container.innerHTML = tools.map(tool => {
+                const isChecked = allowedTools.includes(tool) ? 'checked' : '';
+                return `<label><input type="checkbox" name="tool_sel_${containerId}" value="${tool}" ${isChecked} onchange="updateToolsInput('${inputId}', 'tool_sel_${containerId}')">${tool}</label>`
+            }).join('');
+            
+            // Set initial value
+            if (allowedTools.length > 0) {
+                input.value = JSON.stringify(allowedTools);
+            } else {
+                input.value = '';
+            }
+        }
+        
+        function updatePermTools(userId, connectorName) {
+            updateToolSelector('perm_tools_' + userId, 'perm_tools_input_' + userId, connectorName);
+        }
+        
+        function updateDefaultTools(connectorName) {
+            updateToolSelector('default_tools', 'default_tools_input', connectorName);
+        }
+        
+        function updateToolsInput(inputId, checkboxName) {
+            const checkboxes = document.querySelectorAll('input[name="' + checkboxName + '"]:checked');
+            document.getElementById(inputId).value = JSON.stringify(Array.from(checkboxes).map(cb => cb.value));
         }
     </script>
     {% endblock %}
